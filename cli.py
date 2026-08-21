@@ -130,7 +130,7 @@ def _parse_video_sources(values: Sequence[str] | None) -> list[str]:
     sources = []
     for value in values or ["pexels"]:
         sources.extend(item.strip().lower() for item in value.split(",") if item.strip())
-    valid_sources = {"pexels", "pixabay", "coverr", "youtube", "local"}
+    valid_sources = {"pexels", "pixabay", "coverr", "local"}
     invalid_sources = [source for source in sources if source not in valid_sources]
     if invalid_sources:
         raise argparse.ArgumentTypeError(
