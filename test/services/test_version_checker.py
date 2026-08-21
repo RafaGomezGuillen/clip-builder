@@ -23,11 +23,11 @@ class TestVersionChecker(unittest.TestCase):
 
     @patch("app.services.version_checker.requests.get")
     def test_returns_newer_release_version(self, request_get):
-        request_get.return_value = self._response("v1.4.0")
+        request_get.return_value = self._response("v1.5.0")
 
         result = version_checker.get_available_update("1.3.2")
 
-        self.assertEqual(result, "1.4.0")
+        self.assertEqual(result, "1.5.0")
         request_get.assert_called_once_with(
             version_checker.LATEST_RELEASE_API_URL,
             headers=version_checker.RELEASE_CHECK_HEADERS,
@@ -45,11 +45,11 @@ class TestVersionChecker(unittest.TestCase):
 
     @patch("app.services.version_checker.requests.get")
     def test_prerelease_comparison_uses_semantic_versions(self, request_get):
-        request_get.return_value = self._response("v1.4.0")
+        request_get.return_value = self._response("v1.5.0")
 
-        result = version_checker.get_available_update("1.4.0rc1")
+        result = version_checker.get_available_update("1.5.0rc1")
 
-        self.assertEqual(result, "1.4.0")
+        self.assertEqual(result, "1.5.0")
 
     @patch("app.services.version_checker.requests.get")
     def test_invalid_current_version_skips_network_request(self, request_get):
@@ -108,7 +108,7 @@ class TestAsyncUpdateChecker(unittest.TestCase):
         def slow_check(_current_version):
             check_started.set()
             release_check.wait(timeout=1)
-            return "1.4.0"
+            return "1.5.0"
 
         checker = version_checker.AsyncUpdateChecker(check=slow_check)
 
@@ -119,7 +119,7 @@ class TestAsyncUpdateChecker(unittest.TestCase):
         release_check.set()
         completed = self._wait_for_completion(checker)
         self.assertTrue(completed.complete)
-        self.assertEqual(completed.available_version, "1.4.0")
+        self.assertEqual(completed.available_version, "1.5.0")
 
     def test_concurrent_polls_share_one_background_request(self):
         check_started = Event()
@@ -151,7 +151,7 @@ class TestAsyncUpdateChecker(unittest.TestCase):
 
         def check(current_version):
             calls.append(current_version)
-            return "1.4.0"
+            return "1.5.0"
 
         checker = version_checker.AsyncUpdateChecker(
             check=check,
@@ -161,8 +161,8 @@ class TestAsyncUpdateChecker(unittest.TestCase):
         first_result = self._wait_for_completion(checker)
         cached_result = checker.poll("1.3.2")
 
-        self.assertEqual(first_result.available_version, "1.4.0")
-        self.assertEqual(cached_result.available_version, "1.4.0")
+        self.assertEqual(first_result.available_version, "1.5.0")
+        self.assertEqual(cached_result.available_version, "1.5.0")
         self.assertEqual(calls, ["1.3.2"])
 
         now[0] += 11
