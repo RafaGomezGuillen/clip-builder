@@ -289,6 +289,7 @@
     "Video Encoder": "视频编码器",
     "Default Video Encoder": "默认（推荐）",
     "Video Encoder Help": "高级选项。“默认”跟随项目的稳定编码策略，当前使用 libx264；选择硬件编码器时，如果当前 FFmpeg、显卡或驱动不可用，会自动回退到 libx264。",
+    "Presets": "预设", "Current Preset": "当前预设", "No Preset Selected": "未选择预设", "Apply Preset": "应用", "Update Preset": "更新", "Duplicate Preset": "复制", "Confirm Preset Deletion": "确认删除", "Delete Preset": "删除", "Remove Default Preset": "移除默认", "Set as Default Preset": "设为默认", "Save Current Configuration": "保存当前配置", "Preset Title": "标题", "Preset Description": "描述（可选）", "Save Preset": "保存预设", "Preset Configuration Not Ready": "当前配置尚未准备好。", "Preset Applied": "预设已应用", "Preset Updated": "预设已更新", "Preset Duplicated": "预设已复制", "Preset Deleted": "预设已删除", "Preset Default Updated": "默认预设已更新", "Preset Saved": "预设已保存", "Preset Delete Confirmation": "确定要删除此预设吗？此操作无法撤销。", "Save Preset Details": "保存预设信息", "Preset Details Updated": "预设信息已更新",
     "llm_provider_tips.ollama": "##### Ollama 配置说明\n- **API Key**: 无需填写\n- **Base Url**: 本机运行时通常为 `http://localhost:11434/v1`；Docker 部署时通常为 `http://host.docker.internal:11434/v1`{docker_hint}\n- **Model Name**: 必填；运行 `ollama list` 查看本机已安装的模型，例如 `qwen:7b`",
     "llm_provider_tips.ollama.docker_hint": "\n  > 检测到容器环境，未配置 Base Url 时会默认使用 `http://host.docker.internal:11434/v1`\n",
     "llm_provider_tips.openai": "##### OpenAI 配置说明\n- **API Key**: 在 [OpenAI Platform]({api_key_url}) 创建\n- **Base Url**: 默认 `{default_base_url}`；使用兼容服务时可填写对应地址\n- **Model Name**: 默认 `{default_model}`；也可以填写当前账号支持的其它模型 ID\n> 部分地区访问官方服务时可能需要配置网络代理",

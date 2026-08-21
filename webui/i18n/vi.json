@@ -281,6 +281,7 @@
     "Please Enter the Coverr API Key": "Vui lòng nhập **API Key Coverr**",
     "Video Encoder": "Bộ Mã Hóa Video",
     "Default Video Encoder": "Mặc định (Khuyên dùng)",
-    "Video Encoder Help": "Tùy chọn nâng cao. Mặc định tuân theo chính sách mã hóa ổn định của ứng dụng, hiện là libx264. Nếu bộ mã hóa phần cứng không khả dụng, ứng dụng tự động chuyển về libx264."
+    "Video Encoder Help": "Tùy chọn nâng cao. Mặc định tuân theo chính sách mã hóa ổn định của ứng dụng, hiện là libx264. Nếu bộ mã hóa phần cứng không khả dụng, ứng dụng tự động chuyển về libx264.",
+    "Presets": "Preset", "Current Preset": "Preset hiện tại", "No Preset Selected": "Chưa chọn preset", "Apply Preset": "Áp dụng", "Update Preset": "Cập nhật", "Duplicate Preset": "Nhân bản", "Confirm Preset Deletion": "Xác nhận xóa", "Delete Preset": "Xóa", "Remove Default Preset": "Bỏ mặc định", "Set as Default Preset": "Đặt làm mặc định", "Save Current Configuration": "Lưu cấu hình hiện tại", "Preset Title": "Tiêu đề", "Preset Description": "Mô tả (tùy chọn)", "Save Preset": "Lưu preset", "Preset Configuration Not Ready": "Cấu hình hiện tại chưa sẵn sàng.", "Preset Applied": "Đã áp dụng preset", "Preset Updated": "Đã cập nhật preset", "Preset Duplicated": "Đã nhân bản preset", "Preset Deleted": "Đã xóa preset", "Preset Default Updated": "Đã cập nhật preset mặc định", "Preset Saved": "Đã lưu preset", "Preset Delete Confirmation": "Bạn có chắc muốn xóa preset này không? Hành động này không thể hoàn tác.", "Save Preset Details": "Lưu chi tiết preset", "Preset Details Updated": "Đã cập nhật chi tiết preset"
   }
 }

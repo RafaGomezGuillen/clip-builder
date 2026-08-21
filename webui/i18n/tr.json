@@ -281,6 +281,7 @@
     "Please Enter the Coverr API Key": "Lütfen **Coverr API Anahtarını** girin",
     "Video Encoder": "Video Kodlayıcı",
     "Default Video Encoder": "Varsayılan (Önerilen)",
-    "Video Encoder Help": "Gelişmiş seçenek. Varsayılan, uygulamanın kararlı kodlayıcı politikasını izler; şu anda libx264 kullanılır. Donanım kodlayıcı kullanılamıyorsa uygulama otomatik olarak libx264'e döner."
+    "Video Encoder Help": "Gelişmiş seçenek. Varsayılan, uygulamanın kararlı kodlayıcı politikasını izler; şu anda libx264 kullanılır. Donanım kodlayıcı kullanılamıyorsa uygulama otomatik olarak libx264'e döner.",
+    "Presets": "Ön ayarlar", "Current Preset": "Geçerli ön ayar", "No Preset Selected": "Ön ayar seçilmedi", "Apply Preset": "Uygula", "Update Preset": "Güncelle", "Duplicate Preset": "Kopyala", "Confirm Preset Deletion": "Silmeyi onayla", "Delete Preset": "Sil", "Remove Default Preset": "Varsayılanı kaldır", "Set as Default Preset": "Varsayılan yap", "Save Current Configuration": "Geçerli yapılandırmayı kaydet", "Preset Title": "Başlık", "Preset Description": "Açıklama (isteğe bağlı)", "Save Preset": "Ön ayarı kaydet", "Preset Configuration Not Ready": "Geçerli yapılandırma henüz hazır değil.", "Preset Applied": "Ön ayar uygulandı", "Preset Updated": "Ön ayar güncellendi", "Preset Duplicated": "Ön ayar kopyalandı", "Preset Deleted": "Ön ayar silindi", "Preset Default Updated": "Varsayılan ön ayar güncellendi", "Preset Saved": "Ön ayar kaydedildi", "Preset Delete Confirmation": "Bu ön ayar silinsin mi? Bu işlem geri alınamaz.", "Save Preset Details": "Ön ayar ayrıntılarını kaydet", "Preset Details Updated": "Ön ayar ayrıntıları güncellendi"
   }
 }

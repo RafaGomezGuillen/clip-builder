@@ -44,6 +44,7 @@ from app.models.schema import (
 from app.services import bgm as bgm_service
 from app.services import cache_manager, llm, video, voice, webui_task
 from app.services import elevenlabs_music as elevenlabs_music_service
+from app.services import webui_presets as presets
 from app.services import sonilo as sonilo_service
 from app.services import state as sm
 from app.services import task as tm
@@ -332,6 +333,30 @@ def _initialize_session_state():
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
+
+    st.session_state.setdefault("preset_selected_id", "")
+    st.session_state.setdefault("preset_status", "")
+    st.session_state.setdefault("presets_dialog_open", False)
+    st.session_state.setdefault("preset_delete_candidate_id", "")
+    if not st.session_state.get("preset_default_checked"):
+        default_preset = presets.get_default_preset()
+        if default_preset:
+            default_params = presets.settings_to_params(
+                default_preset.get("settings", {}), VideoParams(video_subject="")
+            )
+            st.session_state["task_restore_payload"] = {
+                "task_id": f"preset:{default_preset.get('id', '')}",
+                "subject": default_preset.get("title", "Preset"),
+                "params": default_params.model_dump(mode="json"),
+                "webui": default_preset.get("settings", {}).get("audio", {}),
+            }
+            default_audio = default_preset.get("settings", {}).get("audio", {})
+            if default_audio.get("voice_mode"):
+                st.session_state["voice_mode_control"] = default_audio["voice_mode"]
+            if default_audio.get("tts_server"):
+                st.session_state["tts_server_select"] = default_audio["tts_server"]
+            st.session_state["preset_selected_id"] = default_preset.get("id", "")
+        st.session_state["preset_default_checked"] = True
 
 
 _initialize_session_state()
@@ -1041,6 +1066,9 @@ def _apply_pending_task_restore():
     bgm_type = params.get("bgm_type") or ""
     _set_stable_widget_value("bgm_type_select", bgm_type)
     _set_stable_widget_value("bgm_volume_select", params.get("bgm_volume", 0.2))
+    restore_webui = payload.get("webui", {})
+    _set_stable_widget_value("voice_mode_control", restore_webui.get("voice_mode"))
+    _set_stable_widget_value("tts_server_select", restore_webui.get("tts_server"))
     st.session_state["custom_bgm_file_input"] = params.get("bgm_file") or ""
     st.session_state["sonilo_bgm_prompt_input"] = (
         params.get("video_music_prompt") or params.get("sonilo_bgm_prompt") or ""
@@ -1090,6 +1118,195 @@ def _apply_pending_task_restore():
     st.session_state["task_restore_succeeded"] = True
     logger.info(f"restored task configuration: {payload['task_id']}")
     return True
+
+
+def _queue_preset_restore(preset):
+    params = presets.settings_to_params(
+        preset.get("settings", {}), VideoParams(video_subject="")
+    )
+    st.session_state["task_restore_payload"] = {
+        "task_id": f"preset:{preset.get('id', '')}",
+        "subject": preset.get("title", "Preset"),
+        "params": params.model_dump(mode="json"),
+        "webui": preset.get("settings", {}).get("audio", {}),
+    }
+    audio_settings = preset.get("settings", {}).get("audio", {})
+    _set_stable_widget_value("voice_mode_control", audio_settings.get("voice_mode"))
+    _set_stable_widget_value("tts_server_select", audio_settings.get("tts_server"))
+    st.session_state["preset_selected_id"] = preset.get("id", "")
+
+
+def _dismiss_presets_dialog():
+    """Close the presets dialog without changing the selected preset."""
+    st.session_state["presets_dialog_open"] = False
+
+
+def _dismiss_preset_delete_dialog():
+    st.session_state["preset_delete_candidate_id"] = ""
+
+
+@st.dialog(tr("Delete Preset"), width="small", on_dismiss=_dismiss_preset_delete_dialog)
+def _render_preset_delete_dialog(preset):
+    st.write(tr("Preset Delete Confirmation"))
+    st.caption(preset.get("title", ""))
+    cancel_col, delete_col = st.columns(2)
+    if cancel_col.button(tr("Cancel"), key="cancel_preset_delete", use_container_width=True):
+        st.session_state["preset_delete_candidate_id"] = ""
+        st.session_state["presets_dialog_open"] = True
+        st.rerun(scope="app")
+    if delete_col.button(
+        tr("Delete Preset"),
+        key="confirm_preset_delete",
+        type="primary",
+        use_container_width=True,
+    ):
+        presets.delete_preset(preset["id"])
+        st.session_state["preset_selected_id"] = ""
+        st.session_state["preset_delete_candidate_id"] = ""
+        st.session_state["presets_dialog_open"] = True
+        st.session_state["preset_status"] = tr("Preset Deleted")
+        st.rerun(scope="app")
+
+
+@st.dialog(
+    tr("Presets"),
+    width="large",
+    on_dismiss=_dismiss_presets_dialog,
+)
+def _render_presets():
+    """Render preset controls beside the metadata and save sections."""
+    saved_presets = presets.load_presets()
+    preset_by_id = {item.get("id"): item for item in saved_presets}
+    with st.container(key="preset_sections"):
+        current_section, details_section = st.columns(2, gap="large")
+        with current_section:
+            _render_current_preset_section(saved_presets, preset_by_id)
+        with details_section:
+            _render_current_preset_metadata(preset_by_id)
+            _render_save_preset_section()
+
+    status = st.session_state.pop("preset_status", "")
+    if status:
+        st.success(status)
+
+
+def _render_current_preset_section(saved_presets, preset_by_id):
+    options = [""] + [item.get("id", "") for item in saved_presets]
+    selected_id = st.selectbox(
+        tr("Current Preset"),
+        options=options,
+        index=options.index(st.session_state.get("preset_selected_id", ""))
+        if st.session_state.get("preset_selected_id", "") in options
+        else 0,
+        format_func=lambda value: tr("No Preset Selected")
+        if not value
+        else preset_by_id.get(value, {}).get("title", value),
+        key="preset_selected_id_control",
+        label_visibility="collapsed",
+    )
+    st.session_state["preset_selected_id"] = selected_id
+    selected = preset_by_id.get(selected_id)
+    if not selected:
+        return
+
+    _render_current_preset_actions(selected)
+
+
+def _render_current_preset_metadata(preset_by_id):
+    selected_id = st.session_state.get("preset_selected_id", "")
+    selected = preset_by_id.get(selected_id)
+
+    if not selected:
+        return
+
+    st.subheader(tr("Current Preset"))
+
+    with st.form(f"edit_preset_metadata_{selected_id}"):
+        edited_title = st.text_input(
+            tr("Preset Title"), value=selected.get("title", "")
+        )
+        edited_description = st.text_area(
+            tr("Preset Description"), value=selected.get("description", "")
+        )
+        save_metadata = st.form_submit_button(
+            tr("Save Preset Details"), use_container_width=True
+        )
+        if save_metadata:
+            try:
+                presets.update_preset_metadata(
+                    selected_id, edited_title, edited_description
+                )
+            except ValueError as exc:
+                st.error(str(exc))
+            else:
+                st.session_state["preset_status"] = tr("Preset Details Updated")
+                st.rerun(scope="app")
+
+
+def _render_current_preset_actions(selected):
+    selected_id = selected["id"]
+    current_params = st.session_state.get("current_generation_params")
+    default_label = (
+        tr("Remove Default Preset")
+        if selected.get("is_default")
+        else tr("Set as Default Preset")
+    )
+    with st.container(key="preset_actions_grid"):
+        first_action_cols = st.columns(3, gap="small")
+        second_action_cols = st.columns(3, gap="small")
+        if first_action_cols[0].button(
+            tr("Apply Preset"), key="apply_preset", use_container_width=True
+        ):
+            _queue_preset_restore(selected)
+            st.session_state["preset_status"] = tr("Preset Applied")
+            st.rerun(scope="app")
+        if first_action_cols[1].button(
+            tr("Update Preset"),
+            key="update_preset",
+            disabled=current_params is None,
+            use_container_width=True,
+        ) and current_params is not None:
+            presets.update_preset(selected_id, current_params)
+            st.session_state["preset_status"] = tr("Preset Updated")
+            st.rerun(scope="app")
+        if first_action_cols[2].button(
+            tr("Duplicate Preset"), key="duplicate_preset", use_container_width=True
+        ):
+            duplicate = presets.duplicate_preset(selected_id)
+            st.session_state["preset_selected_id"] = duplicate["id"]
+            st.session_state["preset_status"] = tr("Preset Duplicated")
+            st.rerun(scope="app")
+        if second_action_cols[0].button(
+            tr("Delete Preset"), key="delete_preset", use_container_width=True
+        ):
+            st.session_state["presets_dialog_open"] = False
+            st.session_state["preset_delete_candidate_id"] = selected_id
+            st.rerun(scope="app")
+        if second_action_cols[1].button(
+            default_label, key="toggle_default_preset", use_container_width=True
+        ):
+            presets.set_default_preset(
+                None if selected.get("is_default") else selected_id
+            )
+            st.session_state["preset_status"] = tr("Preset Default Updated")
+            st.rerun(scope="app")
+
+
+def _render_save_preset_section():
+    st.subheader(tr("Save Current Configuration"))
+    with st.form("save_preset_form", clear_on_submit=True):
+        title = st.text_input(tr("Preset Title"))
+        description = st.text_area(tr("Preset Description"))
+        submitted = st.form_submit_button(tr("Save Preset"), use_container_width=True)
+        if submitted:
+            current_params = st.session_state.get("current_generation_params")
+            if not current_params:
+                st.error(tr("Preset Configuration Not Ready"))
+            else:
+                created = presets.save_preset(title, description, current_params)
+                st.session_state["preset_selected_id"] = created["id"]
+                st.session_state["preset_status"] = tr("Preset Saved")
+                st.rerun(scope="app")
 
 
 def _dismiss_task_restore_dialog():
@@ -1208,6 +1425,15 @@ def _render_top_bar():
             width="stretch",
         ):
             _render_task_manager_entry()
+
+            if st.button(
+                tr("Presets"),
+                key="open_presets_dialog_button",
+                type="secondary",
+                icon=":material/bookmarks:",
+                width="content",
+            ):
+                st.session_state["presets_dialog_open"] = True
 
             if st.button(
                 tr("Settings"),
@@ -4294,6 +4520,20 @@ def _render_application():
 
     if st.session_state.get("settings_dialog_open", False):
         _render_settings_dialog()
+    if st.session_state.get("presets_dialog_open", False):
+        _render_presets()
+    delete_candidate_id = st.session_state.get("preset_delete_candidate_id", "")
+    if delete_candidate_id:
+        delete_candidate = next(
+            (
+                item
+                for item in presets.load_presets()
+                if item.get("id") == delete_candidate_id
+            ),
+            None,
+        )
+        if delete_candidate:
+            _render_preset_delete_dialog(delete_candidate)
 
     restore_applied = _apply_pending_task_restore()
     restore_candidate_id = st.session_state.get("task_restore_candidate_id")
@@ -4322,6 +4562,14 @@ def _render_application():
     )
 
     _render_subtitle_settings(right_panel, params)
+
+    st.session_state["current_generation_params"] = {
+        "params": params.model_dump(mode="json"),
+        "webui": {
+            "tts_server": st.session_state.get("tts_server_select"),
+            "voice_mode": st.session_state.get("voice_mode_control"),
+        },
+    }
 
     generation_submitted = _render_generation_controls(
         params,

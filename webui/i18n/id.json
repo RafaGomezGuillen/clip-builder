@@ -281,6 +281,7 @@
     "Please Enter the Coverr API Key": "Silakan Masukkan **Kunci API Coverr**",
     "Video Encoder": "Encoder Video",
     "Default Video Encoder": "Default (Direkomendasikan)",
-    "Video Encoder Help": "Opsi lanjutan. Default mengikuti kebijakan encoder stabil aplikasi, saat ini libx264. Jika encoder perangkat keras tidak tersedia, aplikasi otomatis kembali ke libx264."
+    "Video Encoder Help": "Opsi lanjutan. Default mengikuti kebijakan encoder stabil aplikasi, saat ini libx264. Jika encoder perangkat keras tidak tersedia, aplikasi otomatis kembali ke libx264.",
+    "Presets": "Presets", "Current Preset": "Preset saat ini", "No Preset Selected": "Belum ada preset", "Apply Preset": "Terapkan", "Update Preset": "Perbarui", "Duplicate Preset": "Duplikat", "Confirm Preset Deletion": "Konfirmasi penghapusan", "Delete Preset": "Hapus", "Remove Default Preset": "Hapus default", "Set as Default Preset": "Jadikan default", "Save Current Configuration": "Simpan konfigurasi saat ini", "Preset Title": "Judul", "Preset Description": "Deskripsi (opsional)", "Save Preset": "Simpan preset", "Preset Configuration Not Ready": "Konfigurasi saat ini belum siap.", "Preset Applied": "Preset diterapkan", "Preset Updated": "Preset diperbarui", "Preset Duplicated": "Preset diduplikasi", "Preset Deleted": "Preset dihapus", "Preset Default Updated": "Preset default diperbarui", "Preset Saved": "Preset disimpan", "Preset Delete Confirmation": "Yakin ingin menghapus preset ini? Tindakan ini tidak dapat dibatalkan.", "Save Preset Details": "Simpan detail preset", "Preset Details Updated": "Detail preset diperbarui"
   }
 }
