@@ -136,6 +136,48 @@ div[class*="st-key-voice_mode_control"] [role="radiogroup"] > button p {
     width: fit-content !important;
 }
 
+/* Preset actions stay compact in the dialog. The empty third cell keeps the
+   second row aligned with the first row on wide screens. */
+.st-key-preset_actions_grid [data-testid="stHorizontalBlock"] {
+    gap: 0.45rem !important;
+}
+
+.st-key-preset_actions_grid [data-testid="stHorizontalBlock"] > div {
+    min-width: 0 !important;
+}
+
+/* The dialog keeps preset selection/actions on the left and the metadata/save
+    stack on the right. The two main columns stack below the mobile breakpoint. */
+.st-key-preset_sections > [data-testid="stHorizontalBlock"] {
+    gap: 1.5rem !important;
+}
+
+.st-key-preset_sections > [data-testid="stHorizontalBlock"] > div {
+    min-width: 0 !important;
+}
+
+@media (max-width: 700px) {
+    .st-key-preset_sections > [data-testid="stHorizontalBlock"] {
+        flex-direction: column !important;
+        gap: 1rem !important;
+    }
+
+    .st-key-preset_sections > [data-testid="stHorizontalBlock"] > div {
+        width: 100% !important;
+        flex: 1 1 100% !important;
+    }
+
+    .st-key-preset_actions_grid [data-testid="stHorizontalBlock"] {
+        flex-direction: column !important;
+        gap: 0.35rem !important;
+    }
+
+    .st-key-preset_actions_grid [data-testid="stHorizontalBlock"] > div {
+        width: 100% !important;
+        flex: 1 1 auto !important;
+    }
+}
+
 @media (max-width: 700px) {
     .mpt-brand > span:first-child {
         gap: 0.45rem;

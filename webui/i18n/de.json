@@ -83,6 +83,7 @@
     "Video Encoder": "Video-Encoder",
     "Default Video Encoder": "Standard (empfohlen)",
     "Video Encoder Help": "Erweiterte Option. Standard folgt der stabilen App-Vorgabe, derzeit libx264. Wenn ein Hardware-Encoder nicht verfügbar ist, fällt die App automatisch auf libx264 zurück.",
+    "Presets": "Presets", "Current Preset": "Aktuelles Preset", "No Preset Selected": "Kein Preset ausgewählt", "Apply Preset": "Anwenden", "Update Preset": "Aktualisieren", "Duplicate Preset": "Duplizieren", "Confirm Preset Deletion": "Löschen bestätigen", "Delete Preset": "Löschen", "Remove Default Preset": "Standard entfernen", "Set as Default Preset": "Als Standard festlegen", "Save Current Configuration": "Aktuelle Konfiguration speichern", "Preset Title": "Titel", "Preset Description": "Beschreibung (optional)", "Save Preset": "Preset speichern", "Preset Configuration Not Ready": "Die aktuelle Konfiguration ist noch nicht bereit.", "Preset Applied": "Preset angewendet", "Preset Updated": "Preset aktualisiert", "Preset Duplicated": "Preset dupliziert", "Preset Deleted": "Preset gelöscht", "Preset Default Updated": "Standard-Preset aktualisiert", "Preset Saved": "Preset gespeichert", "Preset Delete Confirmation": "Möchten Sie dieses Preset wirklich löschen? Diese Aktion kann nicht rückgängig gemacht werden.", "Save Preset Details": "Preset-Daten speichern", "Preset Details Updated": "Preset-Daten aktualisiert",
     "Audio Settings": "**Audio Einstellungen**",
     "Voiceover Mode": "Vertonungsmodus",
     "Automatic Voiceover": "Automatisch",
