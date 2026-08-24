@@ -104,14 +104,14 @@ def test_reusable_generation_settings_survive_a_new_webui_session():
 
         # Aspect is a per-source preference: Coverr's common landscape default
         # must not replace an explicit portrait choice or the Pexels preference.
-        _widget_by_key(first_session.selectbox, "video_source_select").set_value(
-            "coverr"
+        _widget_by_key(first_session.multiselect, "video_sources_select").set_value(
+            ["coverr"]
         ).run()
         _widget_by_key(first_session.selectbox, "video_aspect_for_coverr").set_value(
             "9:16"
         ).run()
-        _widget_by_key(first_session.selectbox, "video_source_select").set_value(
-            "pexels"
+        _widget_by_key(first_session.multiselect, "video_sources_select").set_value(
+            ["pexels"]
         ).run()
 
         _widget_by_key(first_session.selectbox, "bgm_volume_select").set_value(0.4)
@@ -191,14 +191,14 @@ def test_reusable_generation_settings_survive_a_new_webui_session():
         assert _widget_by_key(
             second_session.selectbox, "video_aspect_for_pexels"
         ).value == "16:9"
-        _widget_by_key(second_session.selectbox, "video_source_select").set_value(
-            "coverr"
+        _widget_by_key(second_session.multiselect, "video_sources_select").set_value(
+            ["coverr"]
         ).run()
         assert _widget_by_key(
             second_session.selectbox, "video_aspect_for_coverr"
         ).value == "9:16"
-        _widget_by_key(second_session.selectbox, "video_source_select").set_value(
-            "pexels"
+        _widget_by_key(second_session.multiselect, "video_sources_select").set_value(
+            ["pexels"]
         ).run()
         assert _widget_by_key(
             second_session.selectbox, "video_clip_duration_select"
@@ -339,6 +339,7 @@ def test_loomloom_tuning_survives_restart_without_persisting_payment_state():
     test_app_config = dict(
         config.app,
         video_source="loomloom",
+        video_sources=["loomloom"],
         script_generation_backend="loomloom",
         loomloom_api_token="",
         match_materials_to_script=False,

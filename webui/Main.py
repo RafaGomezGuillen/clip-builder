@@ -442,6 +442,7 @@ def _build_uploaded_file_path(uploaded_file, target_dir, allowed_extensions, pre
 
 def _initialize_session_state():
     """集中初始化跨 rerun 保留的页面状态。"""
+    had_existing_session_state = bool(st.session_state)
     if not st.session_state.get("cross_post_recovery_checked"):
         # WebUI 可以不经过 FastAPI 独立运行，因此也需要在首次会话初始化时处理
         # 进程重启留下的发布状态。恢复失败时不写标记，后续 rerun 会再次尝试。
@@ -549,7 +550,10 @@ def _initialize_session_state():
     st.session_state.setdefault("preset_status", "")
     st.session_state.setdefault("presets_dialog_open", False)
     st.session_state.setdefault("preset_delete_candidate_id", "")
-    if not st.session_state.get("preset_default_checked"):
+    if (
+        not had_existing_session_state
+        and not st.session_state.get("preset_default_checked")
+    ):
         default_preset = presets.get_default_preset()
         if default_preset:
             default_params = presets.settings_to_params(
