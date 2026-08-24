@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import webbrowser
 from collections.abc import Mapping
 from datetime import datetime
@@ -42,7 +43,14 @@ from app.models.schema import (
     VideoTransitionMode,
 )
 from app.services import bgm as bgm_service
-from app.services import cache_manager, llm, video, voice, webui_task
+from app.services import (
+    cache_manager,
+    llm,
+    loomloom,
+    video,
+    voice,
+    webui_task,
+)
 from app.services import elevenlabs_music as elevenlabs_music_service
 from app.services import webui_presets as presets
 from app.services import sonilo as sonilo_service
@@ -86,9 +94,16 @@ DEFAULT_CHATTERBOX_BASE_URL = "http://127.0.0.1:4123/v1"
 DEFAULT_CHATTERBOX_MODEL = "chatterbox"
 DEFAULT_CHATTERBOX_VOICES = ["default-Female"]
 ONBOARDING_TOUR_KEY = "mpt-onboarding-v1"
+CUSTOM_LLM_ENDPOINT_ID = "custom"
 VOICE_MODE_TTS = "tts"
 VOICE_MODE_UPLOAD = "upload"
 VOICE_MODE_NONE = "none"
+LOOMLOOM_MAX_POLL_FAILURES = 5
+# Upload-Post 的 API Key 与发布用户分别在两个页面管理，并且发布用户名称
+# 不等于登录邮箱。集中维护入口可以避免多语言文案各自硬编码 URL 后发生偏差，
+# 也方便用户从 WebUI 直接完成首次配置和后续账号维护。
+UPLOAD_POST_API_KEYS_URL = "https://app.upload-post.com/api-keys"
+UPLOAD_POST_MANAGE_USERS_URL = "https://app.upload-post.com/manage-users"
 # “默认”是 WebUI 专用哨兵，不会写入 config.toml，也不会传给 FFmpeg。
 # 后端在 video_codec 未配置时继续采用稳定的 libx264；单独保留该哨兵可以区分
 # “跟随项目默认策略”和“用户明确固定 libx264”，便于未来安全调整默认策略。
@@ -129,8 +144,64 @@ _RUNTIME_CONFIG_SECTIONS = {
     "elevenlabs": config.elevenlabs,
     "minimax_tts": config.minimax_tts,
     "siliconflow": config.siliconflow,
+    "fish_audio": config.fish_audio,
     "ui": config.ui,
 }
+# 设置预设与密钥备份使用各自的文件标识。导入时先校验 schema 和版本，
+# 避免把任务记录、config.toml 或其它 JSON 误当成本功能的导出文件。
+SETTINGS_PRESET_SCHEMA = "clip-builder.settings-preset"
+SETTINGS_PRESET_VERSION = 1
+SETTINGS_PRESET_FILE_NAME = "clip-builder-settings.json"
+KEY_BACKUP_SCHEMA = "clip-builder.key-backup"
+KEY_BACKUP_VERSION = 1
+KEY_BACKUP_FILE_NAME = "clip-builder-keys.json"
+# 预设只描述生成参数。素材、配音和配乐都是本机文件路径，预设通常要在另一台
+# 机器或另一个容器里导入，带上这些路径只会指向不存在的文件。
+PRESET_EXCLUDED_PARAM_KEYS = frozenset(
+    {
+        "video_materials",
+        "custom_audio_file",
+        "bgm_file",
+    }
+)
+# 密钥按配置项名称后缀识别。新增 Provider 只要沿用现有命名，就会自动进入
+# 备份，不需要再维护第二份密钥清单。
+CREDENTIAL_KEY_SUFFIXES = (
+    "api_key",
+    "api_keys",
+    "api_token",
+    "access_key",
+    "secret_key",
+    "speech_key",
+)
+# 只恢复密钥而不恢复配套配置项时，凭据仍然不可用。这些配套项与密钥一起备份。
+CREDENTIAL_COMPANION_KEYS = {
+    # Azure 语音必须同时知道区域。
+    "azure": ("speech_region",),
+    # Provider 的额外字段由 Registry 声明，例如 Cloudflare AI Gateway 的
+    # Account ID 和 Gateway ID。只恢复 API Key 而丢掉这些字段时，换到另一台
+    # 机器后该 Provider 仍然无法调用。从 Registry 读取可以让以后新增的
+    # Provider 自动进入备份，不需要在这里维护第二份字段清单。
+    "app": tuple(
+        provider.config_key(field.config_suffix)
+        for provider in LLM_PROVIDER_REGISTRY
+        for field in provider.extra_fields
+    ),
+}
+
+NON_LLM_COMPANION_KEYS = {
+    "app": ("upload_post_username",)
+}
+# 同一个密钥在不同面板可能使用各自的控件 key：音频面板直接编辑 Gemini 和
+# MiMo 的 LLM 密钥，胜算云密钥的控件没有 _input 后缀。恢复备份时必须清除
+# 每一个别名，否则遗留的旧值会在下一次 rerun 覆盖刚刚恢复的密钥。
+CREDENTIAL_WIDGET_STATE_ALIASES = {
+    ("app", "gemini_api_key"): ("gemini_tts_api_key_input",),
+    ("app", "mimo_api_key"): ("mimo_tts_api_key_input",),
+    ("app", "loomloom_api_token"): ("loomloom_user_api_token",),
+}
+# ui 分区只保存界面偏好，不含任何凭据，备份时整体跳过。
+KEY_BACKUP_EXCLUDED_SECTIONS = frozenset({"ui"})
 
 
 # -----------------------------------------------------------------------------
@@ -168,6 +239,79 @@ def _save_runtime_config():
     if not saved:
         logger.debug("deferred WebUI config save until active task completes")
     return saved
+
+
+def _saved_ui_choice(key, options, default):
+    """读取一个持久化选择，并把旧配置或手工编辑的非法值降级为默认值。"""
+    options = list(options)
+    saved = config.ui.get(key, default)
+    numeric_default = isinstance(default, (int, float)) and not isinstance(
+        default, bool
+    )
+    # bool 是 int 的子类，``True == 1``。手工把数值选项写成 TOML
+    # 布尔值时必须拒绝，不能让它伪装成第一个数值 option。
+    if numeric_default and isinstance(saved, bool):
+        return default
+    for option in options:
+        if saved == option:
+            # 返回 options 中的真实值，顺便把 TOML 1.0 等价归一化为
+            # 整数选项 1，避免下游参数类型随配置写法漂移。
+            return option
+
+    # TOML 中的数值通常保留原类型；仍兼容用户手工写成字符串的情况。
+    if numeric_default and isinstance(saved, str):
+        try:
+            converted = type(default)(saved)
+        except (TypeError, ValueError):
+            converted = None
+        for option in options:
+            if converted == option:
+                return option
+    return default
+
+
+def _saved_ui_number(key, default, minimum, maximum, number_type=float):
+    """读取并限幅持久化数值，避免非法配置破坏 Streamlit slider。"""
+    try:
+        saved = config.ui.get(key, default)
+        if isinstance(saved, bool):
+            raise ValueError("boolean is not a numeric setting")
+        value = number_type(saved)
+        if isinstance(value, float) and not math.isfinite(value):
+            raise ValueError("non-finite value")
+    except (TypeError, ValueError, OverflowError):
+        value = default
+    return min(maximum, max(minimum, value))
+
+
+def _saved_ui_bool(key, default):
+    """兼容 TOML 布尔值和常见手工字符串，拒绝含义不明的旧值。"""
+    value = config.ui.get(key, default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    return default
+
+
+def _saved_ui_color(key, default):
+    """只把标准六位十六进制颜色传给 Streamlit color picker。"""
+    value = str(config.ui.get(key, default) or "").strip()
+    if re.fullmatch(r"#[0-9a-fA-F]{6}", value):
+        return value
+    return default
+
+
+def _saved_ui_text(key, default="", max_length=None):
+    """读取持久化文本并遵守对应 WebUI 控件的长度上限。"""
+    value = str(config.ui.get(key, default) or default)
+    if max_length is not None:
+        value = value[:max_length]
+    return value
 
 
 def _run_llm_read_operation(operation_name, operation):
@@ -317,10 +461,48 @@ def _initialize_session_state():
         "video_subject": "",
         "video_script": "",
         "video_terms": "",
-        "video_script_prompt": "",
-        "custom_system_prompt": llm.DEFAULT_SCRIPT_SYSTEM_PROMPT,
+        "paragraph_number_input": _saved_ui_number(
+            "paragraph_number",
+            1,
+            llm.MIN_SCRIPT_PARAGRAPH_NUMBER,
+            llm.MAX_SCRIPT_PARAGRAPH_NUMBER,
+            int,
+        ),
+        "video_script_prompt": _saved_ui_text(
+            "video_script_prompt",
+            max_length=llm.MAX_SCRIPT_PROMPT_LENGTH,
+        ),
+        "custom_system_prompt": _saved_ui_text(
+            "custom_system_prompt",
+            llm.DEFAULT_SCRIPT_SYSTEM_PROMPT,
+            llm.MAX_SCRIPT_SYSTEM_PROMPT_LENGTH,
+        ),
         "match_materials_to_script": bool(
             config.app.get("match_materials_to_script", False)
+        ),
+        "custom_bgm_file_input": _saved_ui_text("custom_bgm_file"),
+        "sonilo_bgm_prompt_input": _saved_ui_text(
+            "sonilo_bgm_prompt",
+            max_length=sonilo_service.MAX_PROMPT_LENGTH,
+        ),
+        "elevenlabs_music_prompt_input": _saved_ui_text(
+            "elevenlabs_music_prompt",
+            max_length=elevenlabs_music_service.MAX_PROMPT_LENGTH,
+        ),
+        "subtitle_enabled_checkbox": _saved_ui_bool("subtitle_enabled", True),
+        "stroke_color_picker": _saved_ui_color("stroke_color", "#000000"),
+        "stroke_width_slider": _saved_ui_number(
+            "stroke_width", 1.5, 0.0, 10.0
+        ),
+        "loomloom_candidate_count": _saved_ui_number(
+            "loomloom_candidate_count",
+            3,
+            1,
+            loomloom.MAX_SCRIPT_CANDIDATES,
+            int,
+        ),
+        "loomloom_script_duration_seconds": _saved_ui_number(
+            "loomloom_script_duration_seconds", 60, 10, 600, int
         ),
         "ui_language": initial_ui_language,
         # 已落盘的本地素材允许用户只修改文案后继续复用。
@@ -330,6 +512,35 @@ def _initialize_session_state():
         # 最近一次从当前页面提交的任务。生成改为后台执行后，页面 Fragment
         # 通过这个 ID 查询状态；刷新时不再依赖正在执行的旧页面脚本。
         "current_generation_task_id": "",
+        # LoomLoom 询价与执行必须跨 Streamlit rerun 保留完全相同的输入和
+        # clientRequestId，避免网络重试产生重复付费任务。
+        "loomloom_script_batch": None,
+        "loomloom_script_quote": None,
+        "loomloom_script_input_signature": "",
+        "loomloom_client_request_id": "",
+        "loomloom_run_id": "",
+        "loomloom_run_status": "",
+        "loomloom_run_error": "",
+        "loomloom_poll_failure_count": 0,
+        "loomloom_poll_retry_after": 0.0,
+        "loomloom_poll_paused": False,
+        "loomloom_script_candidates": (),
+        "loomloom_candidate_errors": (),
+        "loomloom_selected_candidate": 0,
+        "loomloom_video_batch": None,
+        "loomloom_video_quote": None,
+        "loomloom_video_input_signature": "",
+        "loomloom_video_client_request_id": "",
+        "loomloom_video_confirm_charge": False,
+        "wavespeed_confirm_charge": False,
+        # AI 视频按素材段计费，默认只生成一段，用户确认效果后再主动增加数量。
+        "loomloom_video_scene_count": _saved_ui_number(
+            "loomloom_video_scene_count",
+            1,
+            1,
+            loomloom.MAX_VIDEO_SCENES,
+            int,
+        ),
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
@@ -364,7 +575,12 @@ _initialize_session_state()
 
 def tr(key):
     loc = locales.get(st.session_state["ui_language"], {})
-    return loc.get("Translation", {}).get(key, key)
+    value = loc.get("Translation", {}).get(key)
+    if value is not None:
+        return value
+    # 新功能优先维护中英文。其它语言缺少单项翻译时统一回退英文，避免在多个
+    # locale 中复制相同英文后长期失去同步；英文也没有该键时才显示原始 key。
+    return locales.get("en", {}).get("Translation", {}).get(key, key)
 
 
 # -----------------------------------------------------------------------------
@@ -681,14 +897,29 @@ def _collect_task_summaries(limit=20):
     return sorted(tasks, key=lambda item: item["mtime"], reverse=True)[:limit]
 
 
+def _is_headless_server():
+    # Docker 或无桌面的服务器部署中，WebUI 进程接触不到用户的桌面环境：
+    # xdg-open / webbrowser 只会在容器内静默失败。此时应改为浏览器内预览
+    # 视频、以路径提示代替打开目录。macOS/Windows 桌面部署不受影响。
+    if sys.platform == "darwin" or sys.platform.startswith("win"):
+        return False
+    return not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+
 def _open_task_path(task_path):
     tasks_root = os.path.abspath(utils.task_dir())
     normalized_path = os.path.abspath(task_path)
     if not normalized_path.startswith(tasks_root + os.sep):
         logger.warning(f"invalid task folder path: {normalized_path}")
         return
-    if os.path.isdir(normalized_path):
-        webbrowser.open(f"file://{normalized_path}")
+    if not os.path.isdir(normalized_path):
+        return
+    if _is_headless_server():
+        # storage 目录通常以卷挂载映射回宿主机，提示相对路径即可定位文件。
+        rel_path = os.path.relpath(normalized_path, os.path.dirname(tasks_root))
+        st.toast(f"{tr('Open Task Folder')}: ./storage/{rel_path}", icon="📂")
+        return
+    webbrowser.open(f"file://{normalized_path}")
 
 
 def _open_task_video(video_file):
@@ -702,6 +933,11 @@ def _open_task_video(video_file):
         return
     if not os.path.isfile(normalized_file):
         logger.warning(f"task video does not exist: {normalized_file}")
+        return
+
+    if _is_headless_server():
+        # 无桌面环境时在任务面板内嵌播放器预览，代替调用系统播放器。
+        st.session_state["task_preview_video_file"] = normalized_file
         return
 
     try:
@@ -917,6 +1153,37 @@ def _render_task_manager_panel(tasks=None):
             ]
             _render_task_table(filtered_tasks, status_key)
 
+    _render_task_video_preview()
+
+
+def _render_task_video_preview():
+    # 无桌面部署下“播放”按钮的浏览器内回退：在任务面板底部渲染播放器。
+    preview_file = st.session_state.get("task_preview_video_file")
+    if not preview_file:
+        return
+
+    tasks_root = os.path.abspath(utils.task_dir())
+    if not (
+        preview_file.startswith(tasks_root + os.sep) and os.path.isfile(preview_file)
+    ):
+        st.session_state.pop("task_preview_video_file", None)
+        return
+
+    st.divider()
+    preview_cols = st.columns([5, 1], vertical_alignment="center")
+    task_name = os.path.basename(os.path.dirname(preview_file))
+    preview_cols[0].caption(f"{os.path.basename(preview_file)} · {task_name}")
+    closed = preview_cols[1].button(
+        "✕",
+        key="close_task_video_preview",
+        use_container_width=True,
+        help=tr("Close"),
+    )
+    if closed:
+        st.session_state.pop("task_preview_video_file", None)
+        return
+    st.video(preview_file)
+
 
 @st.fragment(run_every="2s")
 def _render_task_manager_entry():
@@ -986,6 +1253,8 @@ def _infer_tts_server_from_voice(voice_name):
         return "elevenlabs"
     if voice.is_chatterbox_voice(voice_name):
         return "chatterbox"
+    if voice.is_fish_audio_voice(voice_name):
+        return "fish_audio"
     if voice.is_azure_v2_voice(voice_name):
         return "azure-tts-v2"
     return "azure-tts-v1"
@@ -1001,7 +1270,20 @@ def _apply_pending_task_restore():
     if not payload:
         return False
 
-    params = payload["params"]
+    _apply_restored_params(payload["params"], payload.get("webui", {}))
+    st.session_state["task_restore_succeeded"] = True
+    logger.info(f"restored task configuration: {payload['task_id']}")
+    return True
+
+
+def _apply_restored_params(params, restore_webui=None):
+    """
+    把一份完整的生成参数写回页面控件状态。
+
+    历史任务恢复和设置预设导入使用同一份参数模型，因此共用同一个实现，避免
+    新增字段时只更新其中一条路径。调用方必须在渲染任何控件之前执行，否则
+    Streamlit 会拒绝修改已经实例化的控件状态。
+    """
     video_terms = params.get("video_terms") or ""
     if isinstance(video_terms, list):
         video_terms = ", ".join(str(term) for term in video_terms)
@@ -1066,7 +1348,7 @@ def _apply_pending_task_restore():
     bgm_type = params.get("bgm_type") or ""
     _set_stable_widget_value("bgm_type_select", bgm_type)
     _set_stable_widget_value("bgm_volume_select", params.get("bgm_volume", 0.2))
-    restore_webui = payload.get("webui", {})
+    restore_webui = restore_webui or {}
     _set_stable_widget_value("voice_mode_control", restore_webui.get("voice_mode"))
     _set_stable_widget_value("tts_server_select", restore_webui.get("tts_server"))
     st.session_state["custom_bgm_file_input"] = params.get("bgm_file") or ""
@@ -1115,8 +1397,6 @@ def _apply_pending_task_restore():
         _build_restore_upload_requirements(params)
     )
 
-    st.session_state["task_restore_succeeded"] = True
-    logger.info(f"restored task configuration: {payload['task_id']}")
     return True
 
 
@@ -1484,6 +1764,7 @@ support_locales = [
     "en-US",
     "es-ES",
     "fr-FR",
+    "it-IT",
     "ru-RU",
     "vi-VN",
     "th-TH",
@@ -1803,14 +2084,23 @@ def get_llm_provider_tips(provider_id, **kwargs):
     if not tips:
         return tips
 
+    service_endpoint = provider.preferred_service_endpoint(
+        prefer_international=tips_language == "en"
+    )
+    api_key_url = (
+        service_endpoint.api_key_url
+        if service_endpoint
+        else provider.effective_api_key_url()
+    )
     format_context = {
-        "api_key_url": (
-            provider.international_api_key_url
-            if tips_language == "en" and provider.international_api_key_url
-            else provider.api_key_url
-        ),
+        "api_key_url": api_key_url,
         "default_model": provider.default_model,
-        "default_base_url": provider.default_base_url,
+        "default_base_url": (
+            service_endpoint.base_url
+            if service_endpoint
+            else provider.effective_default_base_url
+        ),
+        "model_docs_url": service_endpoint.model_docs_url if service_endpoint else "",
         **{
             f"default_{field.config_suffix}": field.default_value
             for field in provider.extra_fields
@@ -1822,6 +2112,32 @@ def get_llm_provider_tips(provider_id, **kwargs):
     except Exception as e:
         logger.warning(f"format llm provider tips failed: {provider_id}, {e}")
         return tips
+
+
+def format_llm_connection_error(provider_id, base_url, error):
+    """为可明确定位的鉴权错误补充配置检查建议，同时保留原始响应。"""
+    error_text = str(error or "").strip()
+    normalized_error = error_text.lower()
+    authentication_markers = (
+        "401",
+        "authentication",
+        "invalid api key",
+        "invalid_api_key",
+        "unauthorized",
+    )
+    provider = get_llm_provider(provider_id)
+    if provider is None or not provider.service_endpoints or not any(
+        marker in normalized_error for marker in authentication_markers
+    ):
+        return error_text
+
+    message = tr_optional(
+        provider.authentication_error_key,
+        fallback_language="en",
+    )
+    if not message:
+        return error_text
+    return message.format(base_url=base_url or "-", error=error_text)
 
 
 def get_llm_provider_label(provider):
@@ -1937,11 +2253,14 @@ def reset_subtitle_settings():
 
     # 同步会持久化的 UI 选项，确保恢复后刷新页面仍保持默认设置。
     for key in (
+        "subtitle_enabled",
         "font_name",
         "subtitle_position",
         "custom_position",
         "text_fore_color",
         "font_size",
+        "stroke_color",
+        "stroke_width",
         "subtitle_background_enabled",
         "subtitle_background_color",
         "rounded_subtitle_background",
@@ -2158,6 +2477,319 @@ def _render_cache_management_settings(panel):
 
 
 # -----------------------------------------------------------------------------
+# 设置预设导出导入与密钥备份
+# -----------------------------------------------------------------------------
+
+
+def _is_credential_config_key(key):
+    """判断一个配置项名称是否表示凭据。"""
+    return str(key).endswith(CREDENTIAL_KEY_SUFFIXES)
+
+
+def _is_backup_config_key(section_name, key):
+    """凭据本身及其配套配置项都属于密钥备份范围。"""
+    if _is_credential_config_key(key):
+        return True
+    if key in CREDENTIAL_COMPANION_KEYS.get(section_name, ()):
+        return True
+    return key in NON_LLM_COMPANION_KEYS.get(section_name, ())
+
+
+def _credential_widget_state_keys(section_name, key):
+    """
+    返回某个凭据配置项对应的全部 Streamlit 控件 key。
+
+    密码输入框都带 key，Streamlit 中 session_state 的值优先于控件的 value
+    参数。恢复备份后必须清除这些残留控件状态，否则页面会继续显示旧密钥，
+    并在下一次 rerun 把旧值重新写回配置，让恢复看起来没有生效。多个面板
+    共用同一个密钥时会各自持有控件状态，因此返回默认 key 和全部别名。
+    """
+    if section_name == "app":
+        default_widget_key = f"{key}_input"
+    else:
+        default_widget_key = f"{section_name}_{key}_input"
+    return (
+        default_widget_key,
+        *CREDENTIAL_WIDGET_STATE_ALIASES.get((section_name, key), ()),
+    )
+
+
+def _normalize_backup_value(value):
+    """归一化备份值，丢弃空字符串和空列表，避免恢复时覆盖成空配置。"""
+    if isinstance(value, list):
+        items = [
+            str(item).strip()
+            for item in value
+            if isinstance(item, (str, int, float)) and str(item).strip()
+        ]
+        return items or None
+    if isinstance(value, (str, int, float)) and not isinstance(value, bool):
+        text = str(value).strip()
+        return text or None
+    return None
+
+
+def _collect_key_backup(config_sections):
+    """从运行期配置分区中收集所有已填写的密钥及其配套配置项。"""
+    backup = {}
+    for section_name, section in config_sections.items():
+        if section_name in KEY_BACKUP_EXCLUDED_SECTIONS:
+            continue
+        entries = {}
+        for key, value in section.items():
+            if not _is_backup_config_key(section_name, key):
+                continue
+            normalized_value = _normalize_backup_value(value)
+            if normalized_value is not None:
+                entries[key] = normalized_value
+        if entries:
+            backup[section_name] = entries
+    return backup
+
+
+def _count_backup_keys(backup):
+    """统计备份中的配置项数量，用于界面提示和禁用空导出。"""
+    return sum(len(entries) for entries in backup.values())
+
+
+def _build_key_backup_payload(config_sections, app_version):
+    """构造密钥备份文件内容。"""
+    return {
+        "schema": KEY_BACKUP_SCHEMA,
+        "version": KEY_BACKUP_VERSION,
+        "app_version": str(app_version),
+        "keys": _collect_key_backup(config_sections),
+    }
+
+
+def _load_transfer_payload(raw_bytes, schema, version):
+    """
+    解析导出文件，并校验它确实来自本功能的同一版本。
+
+    用户可能上传任意 JSON。这里只接受声明了正确 schema 和版本的文件，让错误
+    提示停留在导入入口，而不是把无法识别的内容写进配置或控件状态。
+    Windows 编辑器可能保存带 BOM 的 JSON，因此按 utf-8-sig 解码。
+    """
+    payload = json.loads(raw_bytes.decode("utf-8-sig"))
+    if not isinstance(payload, dict):
+        raise ValueError("exported file must contain a JSON object")
+    if payload.get("schema") != schema:
+        raise ValueError(f"unexpected schema: {payload.get('schema')!r}")
+    if payload.get("version") != version:
+        raise ValueError(f"unsupported version: {payload.get('version')!r}")
+    return payload
+
+
+def _parse_key_backup(raw_bytes, config_sections):
+    """
+    解析密钥备份文件，只保留当前版本认识的分区和配置项。
+
+    备份文件可以手工编辑，也可能来自更新的版本。未知分区或非密钥配置项一律
+    忽略，避免通过导入功能改写与凭据无关的配置。
+    """
+    payload = _load_transfer_payload(raw_bytes, KEY_BACKUP_SCHEMA, KEY_BACKUP_VERSION)
+    keys = payload.get("keys")
+    if not isinstance(keys, dict):
+        raise ValueError("key backup file has no keys object")
+
+    restored = {}
+    for section_name, entries in keys.items():
+        if section_name not in config_sections:
+            continue
+        if section_name in KEY_BACKUP_EXCLUDED_SECTIONS:
+            continue
+        if not isinstance(entries, dict):
+            continue
+        section_entries = {}
+        for key, value in entries.items():
+            if not _is_backup_config_key(section_name, key):
+                continue
+            normalized_value = _normalize_backup_value(value)
+            if normalized_value is not None:
+                section_entries[key] = normalized_value
+        if section_entries:
+            restored[section_name] = section_entries
+
+    if not restored:
+        raise ValueError("key backup file contains no restorable keys")
+    return restored
+
+
+def _build_settings_preset_payload(params, app_version):
+    """构造生成参数预设文件内容。"""
+    preset_params = {
+        key: value
+        for key, value in params.items()
+        if key not in PRESET_EXCLUDED_PARAM_KEYS
+    }
+    return {
+        "schema": SETTINGS_PRESET_SCHEMA,
+        "version": SETTINGS_PRESET_VERSION,
+        "app_version": str(app_version),
+        "params": preset_params,
+    }
+
+
+def _parse_settings_preset(raw_bytes):
+    """
+    解析预设文件并交给 VideoParams 校验。
+
+    预设可以在其它机器上生成，也可能被手工编辑。统一走模型校验可以复用既有
+    的取值范围约束，非法预设在导入时就被拒绝，而不是在生成任务时才失败。
+    """
+    payload = _load_transfer_payload(
+        raw_bytes, SETTINGS_PRESET_SCHEMA, SETTINGS_PRESET_VERSION
+    )
+    preset_params = payload.get("params")
+    if not isinstance(preset_params, dict):
+        raise ValueError("settings preset file has no params object")
+
+    params_input = {
+        key: value
+        for key, value in preset_params.items()
+        if key not in PRESET_EXCLUDED_PARAM_KEYS
+    }
+    # video_subject 是 VideoParams 的必填字段，但预设允许只保存风格设置。
+    params_input.setdefault("video_subject", "")
+    return VideoParams.model_validate(params_input).model_dump(mode="json")
+
+
+def _apply_key_backup(restored_keys):
+    """把解析后的密钥写回运行期配置，并清除对应控件的残留状态。"""
+    restored_count = 0
+    for section_name, entries in restored_keys.items():
+        for key, value in entries.items():
+            _set_runtime_config(section_name, key, value)
+            for widget_key in _credential_widget_state_keys(section_name, key):
+                st.session_state.pop(widget_key, None)
+            restored_count += 1
+    # ElevenLabs 音色列表按密钥缓存，换用另一份备份后必须重新拉取。
+    for cache_key in list(st.session_state.keys()):
+        if str(cache_key).startswith("elevenlabs_voices_"):
+            del st.session_state[cache_key]
+    return restored_count
+
+
+def _apply_pending_settings_preset():
+    """在渲染任何控件之前应用已导入的预设。"""
+    preset_params = st.session_state.pop("settings_preset_payload", None)
+    if not preset_params:
+        return False
+
+    _apply_restored_params(preset_params)
+    logger.info("applied imported settings preset")
+    return True
+
+
+def _render_settings_transfer(params):
+    """渲染生成参数预设的导出与导入入口。"""
+    with st.expander(tr("Settings Preset"), expanded=False):
+        st.caption(tr("Settings Preset Help"))
+        preset_payload = _build_settings_preset_payload(
+            params.model_dump(mode="json"), config.project_version
+        )
+        st.download_button(
+            tr("Export Settings"),
+            data=json.dumps(preset_payload, ensure_ascii=False, indent=2).encode(
+                "utf-8"
+            ),
+            file_name=SETTINGS_PRESET_FILE_NAME,
+            mime="application/json",
+            use_container_width=True,
+            key="export_settings_preset_button",
+            icon=":material/download:",
+        )
+        uploaded_preset = st.file_uploader(
+            tr("Import Settings"),
+            type=["json"],
+            key="settings_preset_uploader",
+        )
+        if uploaded_preset is None:
+            return
+        # 上传的文件在之后每次 rerun 都会重新出现。记录已处理的文件标识，
+        # 避免用户改完控件后被同一个预设反复覆盖。
+        if st.session_state.get("settings_preset_file_id") == uploaded_preset.file_id:
+            return
+
+        st.session_state["settings_preset_file_id"] = uploaded_preset.file_id
+        try:
+            preset_params = _parse_settings_preset(uploaded_preset.getvalue())
+        except Exception as e:
+            logger.warning(f"failed to import settings preset: {e}")
+            st.error(tr("Settings Preset Import Failed"))
+            return
+
+        st.session_state["settings_preset_payload"] = preset_params
+        st.rerun()
+
+
+def _render_key_backup_settings(panel):
+    """渲染密钥备份的导出与恢复入口。"""
+    with panel:
+        backup_message = st.session_state.pop("key_backup_message", None)
+        if backup_message:
+            message_type, message = backup_message
+            if message_type == "success":
+                st.success(message)
+            else:
+                st.error(message)
+
+        st.caption(tr("Key Backup Help"))
+        st.warning(tr("Key Backup Warning"))
+
+        backup_payload = _build_key_backup_payload(
+            _RUNTIME_CONFIG_SECTIONS, config.project_version
+        )
+        backup_key_count = _count_backup_keys(backup_payload["keys"])
+        st.caption(tr("Key Backup Summary").format(count=backup_key_count))
+        st.download_button(
+            tr("Export Keys"),
+            data=json.dumps(backup_payload, ensure_ascii=False, indent=2).encode(
+                "utf-8"
+            ),
+            file_name=KEY_BACKUP_FILE_NAME,
+            mime="application/json",
+            disabled=backup_key_count == 0,
+            use_container_width=True,
+            key="export_key_backup_button",
+            icon=":material/download:",
+        )
+
+        uploaded_backup = st.file_uploader(
+            tr("Import Keys"),
+            type=["json"],
+            key="key_backup_uploader",
+        )
+        if uploaded_backup is None:
+            return
+        if st.session_state.get("key_backup_file_id") == uploaded_backup.file_id:
+            return
+
+        st.session_state["key_backup_file_id"] = uploaded_backup.file_id
+        try:
+            restored_keys = _parse_key_backup(
+                uploaded_backup.getvalue(), _RUNTIME_CONFIG_SECTIONS
+            )
+        except Exception as e:
+            logger.warning(f"failed to import key backup: {e}")
+            st.session_state["key_backup_message"] = (
+                "error",
+                tr("Key Restore Failed"),
+            )
+        else:
+            restored_count = _apply_key_backup(restored_keys)
+            _save_runtime_config()
+            logger.info(f"restored keys from backup file: count={restored_count}")
+            st.session_state["key_backup_message"] = (
+                "success",
+                tr("Keys Restored").format(count=restored_count),
+            )
+        # 主页面上的 TTS 密钥输入框也需要读取恢复后的配置，因此整页刷新。
+        # 设置弹窗的打开状态保存在 session_state 中，刷新后会重新展开。
+        st.rerun(scope="app")
+
+
+# -----------------------------------------------------------------------------
 # 设置与提示词弹窗
 # -----------------------------------------------------------------------------
 
@@ -2179,16 +2811,89 @@ def _render_settings_dialog():
         (
             middle_config_panel,
             right_config_panel,
+            key_backup_panel,
             cache_config_panel,
+            publish_config_panel,
             left_config_panel,
         ) = st.tabs(
             [
                 tr("LLM Settings Tab"),
                 tr("Material API Tab"),
+                tr("Key Backup Tab"),
                 tr("Cache Management Tab"),
+                tr("Auto-Publish Settings"),
                 tr("Interface Settings Tab"),
             ]
         )
+
+        with publish_config_panel:
+            st.write(tr("Automatically publish generated videos to social media using upload-post.com"))
+            st.info(
+                tr("Upload-Post Setup Guide").format(
+                    api_keys_url=UPLOAD_POST_API_KEYS_URL,
+                    manage_users_url=UPLOAD_POST_MANAGE_USERS_URL,
+                )
+            )
+
+            is_enabled = config.app.get("upload_post_enabled", False)
+            is_auto = config.app.get("upload_post_auto_upload", False)
+            ui_state = is_enabled and is_auto
+
+            upload_post_enabled = st.checkbox(
+                tr("Enable Auto-Publish"),
+                value=ui_state,
+                key="upload_post_enabled_checkbox"
+            )
+            if upload_post_enabled != is_enabled or upload_post_enabled != is_auto:
+                _set_runtime_config("app", "upload_post_enabled", upload_post_enabled)
+                _set_runtime_config("app", "upload_post_auto_upload", upload_post_enabled)
+
+            upload_post_api_key = st.text_input(
+                tr("Upload-Post API Key"),
+                value=config.app.get("upload_post_api_key", ""),
+                type="password",
+                help=tr("Upload-Post API Key Help").format(
+                    api_keys_url=UPLOAD_POST_API_KEYS_URL
+                ),
+                key="upload_post_api_key_input"
+            )
+            if upload_post_api_key != config.app.get("upload_post_api_key", ""):
+                _set_runtime_config("app", "upload_post_api_key", upload_post_api_key)
+
+            upload_post_username = st.text_input(
+                tr("Upload-Post Profile Username"),
+                value=config.app.get("upload_post_username", ""),
+                help=tr("Upload-Post Profile Username Help").format(
+                    manage_users_url=UPLOAD_POST_MANAGE_USERS_URL
+                ),
+                key="upload_post_username_input"
+            )
+            if upload_post_username != config.app.get("upload_post_username", ""):
+                _set_runtime_config("app", "upload_post_username", upload_post_username)
+
+            upload_post_platforms = st.multiselect(
+                tr("Platforms"),
+                options=["tiktok", "instagram", "youtube"],
+                default=config.app.get("upload_post_platforms", ["tiktok", "instagram"]),
+                help="Select platforms to publish to",
+                key="upload_post_platforms_multiselect"
+            )
+            if upload_post_platforms != config.app.get("upload_post_platforms", ["tiktok", "instagram"]):
+                _set_runtime_config("app", "upload_post_platforms", upload_post_platforms)
+
+            if "youtube" in upload_post_platforms:
+                yt_status_options = ["public", "private", "unlisted"]
+                yt_saved = config.app.get("upload_post_youtube_privacy_status", "public")
+                if yt_saved not in yt_status_options:
+                    yt_saved = "public"
+                upload_post_youtube_privacy_status = st.selectbox(
+                    tr("YouTube Privacy Status"),
+                    options=yt_status_options,
+                    index=yt_status_options.index(yt_saved),
+                    key="upload_post_youtube_privacy_status_selectbox"
+                )
+                if upload_post_youtube_privacy_status != config.app.get("upload_post_youtube_privacy_status", "public"):
+                    _set_runtime_config("app", "upload_post_youtube_privacy_status", upload_post_youtube_privacy_status)
 
         # 左侧面板 - 日志设置
         with left_config_panel:
@@ -2200,6 +2905,8 @@ def _render_settings_dialog():
             _set_runtime_config("ui", "hide_log", hide_log)
 
         _render_cache_management_settings(cache_config_panel)
+        # 密钥恢复会写回配置并清除密码控件状态，必须在下面渲染这些控件之前执行。
+        _render_key_backup_settings(key_backup_panel)
 
         # 中间面板 - LLM 设置
 
@@ -2242,16 +2949,95 @@ def _render_settings_dialog():
                 raise RuntimeError(f"unsupported llm provider: {llm_provider}")
 
             llm_api_key = config.app.get(llm_provider_spec.config_key("api_key"), "")
-            llm_base_url = (
-                config.app.get(llm_provider_spec.config_key("base_url"), "")
-                or llm_provider_spec.default_base_url
+            configured_llm_base_url = config.app.get(
+                llm_provider_spec.config_key("base_url"), ""
             )
-            llm_default_base_url = llm_provider_spec.default_base_url
+            llm_default_base_url = llm_provider_spec.effective_default_base_url
+            llm_base_url = configured_llm_base_url or llm_default_base_url
             llm_model_name = llm_provider_spec.resolve_model_name(
                 config.app.get(llm_provider_spec.config_key("model_name"), "")
             )
 
             provider_tip_context = {}
+            selected_service_endpoint = None
+            if llm_provider_spec.service_endpoints:
+                # Kimi 等 Provider 的中国站和国际站使用不同账号体系。只让用户
+                # 选择服务区域，再由 Registry 同步 API 申请入口和 Base URL，
+                # 避免手工组合错误。已有空 Base URL 配置继续沿用中国站，只有
+                # 尚未填写 Key 的全新配置才根据界面语言推荐对应入口。
+                selected_service_endpoint = (
+                    llm_provider_spec.select_service_endpoint(
+                        configured_llm_base_url,
+                        has_api_key=bool(str(llm_api_key).strip()),
+                        prefer_international=(
+                            st.session_state.get("ui_language", "en") != "zh"
+                        ),
+                    )
+                )
+                endpoint_options = [
+                    endpoint.endpoint_id
+                    for endpoint in llm_provider_spec.service_endpoints
+                ] + [CUSTOM_LLM_ENDPOINT_ID]
+                default_endpoint_id = (
+                    selected_service_endpoint.endpoint_id
+                    if selected_service_endpoint
+                    else CUSTOM_LLM_ENDPOINT_ID
+                )
+                endpoint_labels = {
+                    endpoint.endpoint_id: (
+                        tr_optional(
+                            llm_provider_spec.endpoint_label_key(endpoint.endpoint_id),
+                            fallback_language="en",
+                        )
+                        or endpoint.default_label
+                    )
+                    for endpoint in llm_provider_spec.service_endpoints
+                }
+                endpoint_labels[CUSTOM_LLM_ENDPOINT_ID] = (
+                    tr_optional("Custom API Endpoint", fallback_language="en")
+                    or "Custom API Endpoint"
+                )
+                with llm_form_panel:
+                    selected_endpoint_id = stable_selectbox(
+                        tr_optional(
+                            llm_provider_spec.endpoint_selector_label_key,
+                            fallback_language="en",
+                        )
+                        or tr("API Platform"),
+                        options=endpoint_options,
+                        default_value=default_endpoint_id,
+                        key=f"{llm_provider}_service_endpoint_select",
+                        format_func=lambda endpoint_id: endpoint_labels[endpoint_id],
+                        help=(
+                            tr_optional(
+                                llm_provider_spec.endpoint_selector_help_key,
+                                fallback_language="en",
+                            )
+                            or None
+                        ),
+                    )
+                selected_service_endpoint = next(
+                    (
+                        endpoint
+                        for endpoint in llm_provider_spec.service_endpoints
+                        if endpoint.endpoint_id == selected_endpoint_id
+                    ),
+                    None,
+                )
+                if selected_service_endpoint:
+                    llm_base_url = selected_service_endpoint.base_url
+                    provider_tip_context.update(
+                        {
+                            "api_key_url": selected_service_endpoint.api_key_url,
+                            "default_base_url": selected_service_endpoint.base_url,
+                            "model_docs_url": selected_service_endpoint.model_docs_url,
+                        }
+                    )
+                else:
+                    # 自定义模式只保留用户明确保存的地址，不将某个标准区域伪装
+                    # 成自定义值。输入为空时配置不会持久化，下一次仍回到兼容默认。
+                    llm_base_url = str(configured_llm_base_url or "").strip()
+
             if llm_provider == "ollama":
                 llm_default_base_url = config.get_default_ollama_base_url()
                 if not llm_base_url:
@@ -2283,7 +3069,13 @@ def _render_settings_dialog():
                 st_llm_base_url = llm_form_panel.text_input(
                     tr("Base Url"),
                     value=llm_base_url,
-                    key=f"{llm_provider}_base_url_input",
+                    key=(
+                        f"{llm_provider}_base_url_"
+                        f"{selected_service_endpoint.endpoint_id}_input"
+                        if selected_service_endpoint
+                        else f"{llm_provider}_base_url_custom_input"
+                    ),
+                    disabled=selected_service_endpoint is not None,
                 )
             st_llm_model_name = ""
             if llm_provider == "groq":
@@ -2393,6 +3185,11 @@ def _render_settings_dialog():
                         )
                     )
                 else:
+                    connection_error = format_llm_connection_error(
+                        llm_provider,
+                        st_llm_base_url,
+                        connection_error,
+                    )
                     llm_form_panel.error(
                         tr("LLM Connection Test Failed").format(error=connection_error)
                     )
@@ -2426,12 +3223,593 @@ def _render_settings_dialog():
             )
             _save_material_api_keys("coverr_api_keys", coverr_api_key)
 
+            wavespeed_api_key = _get_material_api_keys("wavespeed_api_keys")
+            wavespeed_api_key = st.text_input(
+                tr("WaveSpeed API Key"),
+                value=wavespeed_api_key,
+                type="password",
+                key="wavespeed_api_keys_input",
+            )
+            _save_material_api_keys("wavespeed_api_keys", wavespeed_api_key)
+
     _save_runtime_config()
 
 
 # -----------------------------------------------------------------------------
 # 主生成表单：文案、视频、音频与字幕面板
 # -----------------------------------------------------------------------------
+
+
+def _create_loomloom_script_backend():
+    """从当前 WebUI/config.toml 配置创建批量文案客户端。"""
+    app_config_snapshot = config.snapshot_config_with_pending(config.app)
+    settings = loomloom.LoomLoomSettings.from_mapping(app_config_snapshot)
+    return loomloom.LoomLoomScriptBackend(settings)
+
+
+def _create_loomloom_video_backend():
+    """使用项目默认 SkillBot 和当前有效凭证创建视频客户端。"""
+    app_config_snapshot = config.snapshot_config_with_pending(config.app)
+    settings = loomloom.video_settings_from_mapping(app_config_snapshot)
+    return loomloom.LoomLoomVideoBackend(settings)
+
+
+def _effective_loomloom_api_token():
+    """读取 WebUI 尚未落盘或 config.toml 中的胜算云 API Key。"""
+    app_config_snapshot = config.snapshot_config_with_pending(config.app)
+    return loomloom.resolve_api_token(app_config_snapshot)
+
+
+def _effective_script_generation_backend():
+    """读取包含 WebUI 待保存修改的文案生成方式。"""
+    app_config_snapshot = config.snapshot_config_with_pending(config.app)
+    backend = str(
+        app_config_snapshot.get("script_generation_backend", "local") or "local"
+    ).strip()
+    return backend if backend in {"local", "loomloom"} else "local"
+
+
+def _render_loomloom_api_token_input():
+    """仅在未选择胜算云 Provider 时显示独立 LoomLoom 密钥输入。"""
+    app_config_snapshot = config.snapshot_config_with_pending(config.app)
+    if str(app_config_snapshot.get("llm_provider", "") or "").lower() == "shengsuanyun":
+        st.caption(tr("Shengsuan Cloud API Key Reused"))
+        return loomloom.resolve_api_token(app_config_snapshot)
+
+    configured_token = loomloom.resolve_api_token(app_config_snapshot)
+    st.session_state.setdefault("loomloom_user_api_token", configured_token)
+    api_token = st.text_input(
+        tr("Shengsuan Cloud API Key"),
+        type="password",
+        key="loomloom_user_api_token",
+        help=tr("Shengsuan Cloud API Key Help"),
+        placeholder=tr("Shengsuan Cloud API Key Placeholder"),
+    ).strip()
+    _set_runtime_config("app", "loomloom_api_token", api_token)
+    return _effective_loomloom_api_token()
+
+
+def _loomloom_video_scene_prompts(video_terms, subject, scene_count):
+    """按素材关键词生成有限数量的场景描述，供视频模型逐段生成素材。"""
+    if isinstance(video_terms, str):
+        terms = [
+            term.strip() for term in re.split(r"[,，\n]", video_terms) if term.strip()
+        ]
+    elif isinstance(video_terms, list):
+        terms = [
+            str(term or "").strip() for term in video_terms if str(term or "").strip()
+        ]
+    else:
+        terms = []
+    fallback = str(subject or "").strip()
+    if not terms and fallback:
+        terms = [fallback]
+    if not terms:
+        return ()
+    return tuple(
+        (
+            terms[index % len(terms)]
+            if index < len(terms)
+            else f"{terms[index % len(terms)]}; alternative camera angle {index + 1}"
+        )
+        for index in range(int(scene_count))
+    )
+
+
+def _loomloom_video_signature(batch, credential_fingerprint):
+    """将全部计费输入和凭证摘要纳入签名，参数变化后强制重新报价。"""
+    payload = {
+        "inputRows": [dict(row) for row in batch.input_rows],
+        "credentialFingerprint": str(credential_fingerprint or "").strip(),
+    }
+    serialized = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _current_loomloom_video_quote_context(params):
+    """根据当前页面参数构建默认 SkillBot 的视频报价批次。"""
+    token = _effective_loomloom_api_token()
+    scene_count = int(st.session_state.get("loomloom_video_scene_count", 1) or 1)
+    prompts = _loomloom_video_scene_prompts(
+        params.video_terms,
+        params.video_subject or params.video_script,
+        scene_count,
+    )
+    if not token or not prompts:
+        return None, ""
+    try:
+        batch = _create_loomloom_video_backend().prepare_video_batch(
+            subject=params.video_subject or params.video_script,
+            scene_prompts=prompts,
+            aspect_ratio=str(
+                params.video_aspect.value
+                if isinstance(params.video_aspect, VideoAspect)
+                else params.video_aspect
+            ),
+        )
+    except (loomloom.LoomLoomError, ValueError):
+        return None, ""
+    fingerprint = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    return batch, _loomloom_video_signature(batch, fingerprint)
+
+
+def _render_loomloom_video_settings(params):
+    """渲染默认视频 SkillBot 的报价、报价失效和付费确认流程。"""
+    st.caption(tr("Shengsuan Cloud AI Video Help"))
+    if _effective_script_generation_backend() != "loomloom":
+        _render_loomloom_api_token_input()
+    elif (
+        str(
+            config.snapshot_config_with_pending(config.app).get("llm_provider", "")
+            or ""
+        ).lower()
+        == "shengsuanyun"
+    ):
+        st.caption(tr("Shengsuan Cloud API Key Reused"))
+
+    token = _effective_loomloom_api_token()
+
+    scene_count = st.number_input(
+        tr("AI Video Scene Count"),
+        min_value=1,
+        max_value=loomloom.MAX_VIDEO_SCENES,
+        step=1,
+        key="loomloom_video_scene_count",
+    )
+    _set_runtime_config("ui", "loomloom_video_scene_count", int(scene_count))
+    batch, input_signature = _current_loomloom_video_quote_context(params)
+    if not token:
+        st.warning(tr("Shengsuan Cloud API Key Required"))
+
+    if st.button(
+        tr("Get LoomLoom Quote"),
+        key="loomloom_quote_videos",
+        use_container_width=True,
+        type="secondary",
+        icon=":material/request_quote:",
+        disabled=not token or batch is None,
+    ):
+        try:
+            quote_result = _create_loomloom_video_backend().quote(batch)
+        except (loomloom.LoomLoomError, ValueError) as exc:
+            logger.warning(f"failed to quote LoomLoom videos: error={exc}")
+            st.error(str(exc))
+        else:
+            st.session_state["loomloom_video_batch"] = batch
+            st.session_state["loomloom_video_quote"] = quote_result
+            st.session_state["loomloom_video_input_signature"] = input_signature
+            st.session_state["loomloom_video_client_request_id"] = (
+                f"mpt-video-{uuid4()}"
+            )
+            st.session_state["loomloom_video_confirm_charge"] = False
+            logger.info(
+                "LoomLoom video quote ready: "
+                f"tasks={quote_result.task_count}, currency={quote_result.currency}, "
+                f"estimated_payable_t={quote_result.estimated_buyer_payable_t}"
+            )
+
+    quote_result = st.session_state.get("loomloom_video_quote")
+    quoted_batch = st.session_state.get("loomloom_video_batch")
+    if quote_result is not None and quoted_batch is not None:
+        display_amount = (
+            quote_result.estimated_buyer_payable_amount
+            or f"{quote_result.estimated_buyer_payable_t} T"
+        )
+        st.success(
+            tr(
+                "AI Video Quote Summary Singular"
+                if quote_result.task_count == 1
+                else "AI Video Quote Summary"
+            ).format(
+                tasks=quote_result.task_count,
+                amount=display_amount,
+                currency=quote_result.currency,
+            )
+        )
+        quote_is_current = (
+            st.session_state.get("loomloom_video_input_signature") == input_signature
+        )
+        if not quote_is_current:
+            st.warning(tr("LoomLoom Quote Changed Warning"))
+        st.checkbox(
+            tr("Confirm AI Video Charge"),
+            key="loomloom_video_confirm_charge",
+            help=tr("Confirm AI Video Charge Help"),
+            disabled=not quote_is_current,
+        )
+
+
+def _loomloom_script_signature(
+    *,
+    subject,
+    language,
+    candidate_count,
+    duration_seconds,
+    style,
+    credential_fingerprint,
+):
+    payload = {
+        "subject": str(subject or "").strip(),
+        "language": str(language or "auto").strip() or "auto",
+        "candidateCount": int(candidate_count),
+        "durationSeconds": int(duration_seconds),
+        "style": str(style or "").strip(),
+        "credentialFingerprint": str(credential_fingerprint or "").strip(),
+    }
+    serialized = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _render_local_script_generation(params):
+    """保留 clip-builder 原有的本地 LLM 脚本生成路径。"""
+    if not st.button(
+        tr("Generate Video Script and Keywords"),
+        key="auto_generate_script",
+        use_container_width=True,
+        type="secondary",
+        icon=":material/auto_awesome:",
+    ):
+        return
+
+    if not params.video_subject:
+        st.toast(tr("Please Enter the Video Subject First"))
+        st.warning(tr("Please Enter the Video Subject First"))
+        return
+
+    with st.spinner(tr("Generating Video Script and Keywords")):
+
+        def generate_script_and_terms(app_config_snapshot):
+            script = llm.generate_script(
+                video_subject=params.video_subject,
+                language=params.video_language,
+                paragraph_number=params.paragraph_number,
+                video_script_prompt=params.video_script_prompt,
+                custom_system_prompt=params.custom_system_prompt,
+                app_config=app_config_snapshot,
+            )
+            terms = llm.generate_terms(
+                params.video_subject,
+                script,
+                amount=8 if params.match_materials_to_script else 5,
+                match_script_order=params.match_materials_to_script,
+                app_config=app_config_snapshot,
+            )
+            return script, terms
+
+        script, terms = _run_llm_read_operation(
+            "generate_script_and_terms",
+            generate_script_and_terms,
+        )
+        if "Error: " in script:
+            st.error(tr(script))
+        elif "Error: " in terms:
+            st.error(tr(terms))
+        else:
+            st.session_state["video_script"] = script
+            st.session_state["video_terms"] = ", ".join(terms)
+
+
+def _render_loomloom_candidates():
+    candidates = tuple(st.session_state.get("loomloom_script_candidates") or ())
+    errors = tuple(st.session_state.get("loomloom_candidate_errors") or ())
+    if errors:
+        st.warning(
+            tr("LoomLoom Candidate Errors").format(
+                count=len(errors),
+                details="; ".join(
+                    f"#{error.row_index + 1}: {error.message}" for error in errors
+                ),
+            )
+        )
+    if not candidates:
+        return
+
+    selected_index = st.radio(
+        tr("Choose Script Candidate"),
+        options=list(range(len(candidates))),
+        key="loomloom_selected_candidate",
+        format_func=lambda index: (
+            f"#{candidates[index].row_index + 1} {candidates[index].script[:80]}"
+        ),
+    )
+    selected = candidates[selected_index]
+    st.code(selected.script, language=None, wrap_lines=True)
+    st.caption(", ".join(selected.video_terms))
+    if st.button(
+        tr("Use Selected Candidate"),
+        key="loomloom_apply_candidate",
+        type="primary",
+        use_container_width=True,
+    ):
+        st.session_state["video_script"] = selected.script
+        st.session_state["video_terms"] = ", ".join(selected.video_terms)
+        st.toast(tr("LoomLoom Candidate Applied"))
+
+
+def _handle_loomloom_poll_error(run_id, exc):
+    """对脚本任务轮询错误做有限退避，确定性错误立即停止轮询。"""
+    logger.warning(f"failed to poll LoomLoom run: run_id={run_id}, error={exc}")
+    failure_count = int(st.session_state.get("loomloom_poll_failure_count", 0) or 0) + 1
+    retryable = isinstance(exc, loomloom.LoomLoomAPIError) and exc.retryable
+    if not retryable or failure_count >= LOOMLOOM_MAX_POLL_FAILURES:
+        st.session_state["loomloom_run_error"] = str(exc)
+        st.session_state["loomloom_poll_failure_count"] = 0
+        st.session_state["loomloom_poll_retry_after"] = 0.0
+        # 查询失败不等于远端付费任务失败。保留 run_id 并暂停自动轮询，让用户
+        # 可以继续查询同一个任务；如果直接丢弃 ID 后重新提交，可能重复付费。
+        st.session_state["loomloom_poll_paused"] = True
+        st.rerun(scope="app")
+        return
+
+    retry_delay = min(2**failure_count, 30)
+    st.session_state["loomloom_poll_failure_count"] = failure_count
+    st.session_state["loomloom_poll_retry_after"] = time.monotonic() + retry_delay
+    st.warning(
+        tr("LoomLoom Poll Retry Warning").format(
+            attempt=failure_count,
+            max_attempts=LOOMLOOM_MAX_POLL_FAILURES,
+        )
+    )
+
+
+@st.fragment(run_every="2s")
+def _render_loomloom_run_progress():
+    run_id = str(st.session_state.get("loomloom_run_id", "") or "").strip()
+    if not run_id or st.session_state.get("loomloom_poll_paused", False):
+        return
+    retry_after = float(st.session_state.get("loomloom_poll_retry_after", 0.0) or 0.0)
+    retry_wait_seconds = max(0, int(math.ceil(retry_after - time.monotonic())))
+    if retry_wait_seconds > 0:
+        st.info(
+            tr("LoomLoom Poll Retry Pending").format(
+                seconds=retry_wait_seconds,
+            )
+        )
+        return
+    try:
+        backend = _create_loomloom_script_backend()
+        run = backend.get_run(run_id)
+    except loomloom.LoomLoomError as exc:
+        _handle_loomloom_poll_error(run_id, exc)
+        return
+
+    st.session_state["loomloom_run_status"] = run.status
+    if run.status == "completed":
+        try:
+            result = backend.get_script_results(run_id)
+        except loomloom.LoomLoomError as exc:
+            _handle_loomloom_poll_error(run_id, exc)
+            return
+        st.session_state["loomloom_poll_failure_count"] = 0
+        st.session_state["loomloom_poll_retry_after"] = 0.0
+        st.session_state["loomloom_poll_paused"] = False
+        st.session_state["loomloom_script_candidates"] = result.candidates
+        st.session_state["loomloom_candidate_errors"] = result.errors
+        st.session_state["loomloom_selected_candidate"] = 0
+        st.session_state["loomloom_run_id"] = ""
+        st.rerun(scope="app")
+        return
+    if run.status in {"failed", "cancelled", "canceled"}:
+        st.session_state["loomloom_run_error"] = run.first_error_message or run.status
+        st.session_state["loomloom_run_id"] = ""
+        st.session_state["loomloom_poll_paused"] = False
+        st.rerun(scope="app")
+        return
+
+    st.session_state["loomloom_poll_failure_count"] = 0
+    st.session_state["loomloom_poll_retry_after"] = 0.0
+    st.info(
+        tr("LoomLoom Run Progress").format(
+            completed=run.completed_tasks,
+            total=run.total_tasks,
+        )
+    )
+
+
+def _render_loomloom_script_generation(params):
+    st.caption(tr("LoomLoom Batch Script Generation Help"))
+    effective_token = _render_loomloom_api_token_input()
+    if not effective_token:
+        st.warning(tr("Shengsuan Cloud API Key Required"))
+
+    candidate_col, duration_col = st.columns(2)
+    candidate_count = candidate_col.number_input(
+        tr("Script Candidate Count"),
+        min_value=1,
+        max_value=loomloom.MAX_SCRIPT_CANDIDATES,
+        step=1,
+        key="loomloom_candidate_count",
+    )
+    duration_seconds = duration_col.number_input(
+        tr("Target Script Duration Seconds"),
+        min_value=10,
+        max_value=600,
+        step=10,
+        key="loomloom_script_duration_seconds",
+    )
+    _set_runtime_config("ui", "loomloom_candidate_count", int(candidate_count))
+    _set_runtime_config(
+        "ui", "loomloom_script_duration_seconds", int(duration_seconds)
+    )
+    input_signature = _loomloom_script_signature(
+        subject=params.video_subject,
+        language=params.video_language,
+        candidate_count=candidate_count,
+        duration_seconds=duration_seconds,
+        style=params.video_script_prompt,
+        credential_fingerprint=(
+            hashlib.sha256(effective_token.encode("utf-8")).hexdigest()
+            if effective_token
+            else ""
+        ),
+    )
+
+    if st.button(
+        tr("Get LoomLoom Quote"),
+        key="loomloom_quote_scripts",
+        use_container_width=True,
+        type="secondary",
+        icon=":material/request_quote:",
+        disabled=not effective_token or bool(st.session_state.get("loomloom_run_id")),
+    ):
+        if not params.video_subject:
+            st.toast(tr("Please Enter the Video Subject First"))
+            st.warning(tr("Please Enter the Video Subject First"))
+        else:
+            try:
+                backend = _create_loomloom_script_backend()
+                batch = backend.prepare_script_batch(
+                    subject=params.video_subject,
+                    candidate_count=int(candidate_count),
+                    language=params.video_language,
+                    duration_seconds=int(duration_seconds),
+                    style=params.video_script_prompt,
+                )
+                quote_result = backend.quote(batch)
+            except (loomloom.LoomLoomError, ValueError) as exc:
+                logger.warning(f"failed to quote LoomLoom scripts: error={exc}")
+                st.error(str(exc))
+            else:
+                st.session_state["loomloom_script_batch"] = batch
+                st.session_state["loomloom_script_quote"] = quote_result
+                st.session_state["loomloom_script_input_signature"] = input_signature
+                st.session_state["loomloom_client_request_id"] = f"mpt-{uuid4()}"
+                st.session_state["loomloom_run_id"] = ""
+                st.session_state["loomloom_run_status"] = "quoted"
+                st.session_state["loomloom_run_error"] = ""
+                st.session_state["loomloom_poll_failure_count"] = 0
+                st.session_state["loomloom_poll_retry_after"] = 0.0
+                st.session_state["loomloom_poll_paused"] = False
+                st.session_state["loomloom_script_candidates"] = ()
+                st.session_state["loomloom_candidate_errors"] = ()
+                st.session_state["loomloom_confirm_charge"] = False
+                logger.info(
+                    "LoomLoom script quote ready: "
+                    f"tasks={quote_result.task_count}, currency={quote_result.currency}, "
+                    f"estimated_payable_t={quote_result.estimated_buyer_payable_t}"
+                )
+
+    quote_result = st.session_state.get("loomloom_script_quote")
+    batch = st.session_state.get("loomloom_script_batch")
+    if quote_result is not None and batch is not None:
+        display_amount = (
+            quote_result.estimated_buyer_payable_amount
+            or f"{quote_result.estimated_buyer_payable_t} T"
+        )
+        st.success(
+            tr(
+                "LoomLoom Quote Summary Singular"
+                if quote_result.task_count == 1
+                else "LoomLoom Quote Summary"
+            ).format(
+                tasks=quote_result.task_count,
+                amount=display_amount,
+                currency=quote_result.currency,
+            )
+        )
+        quote_is_current = (
+            st.session_state.get("loomloom_script_input_signature") == input_signature
+        )
+        if not quote_is_current:
+            st.warning(tr("LoomLoom Quote Changed Warning"))
+        confirm_charge = st.checkbox(
+            tr("Confirm LoomLoom Charge"),
+            key="loomloom_confirm_charge",
+            disabled=not quote_is_current,
+        )
+        run_in_progress = bool(st.session_state.get("loomloom_run_id"))
+        if st.button(
+            tr("Run LoomLoom Batch"),
+            key="loomloom_execute_scripts",
+            use_container_width=True,
+            type="primary",
+            disabled=(not quote_is_current or not confirm_charge or run_in_progress),
+        ):
+            try:
+                execution = _create_loomloom_script_backend().execute(
+                    batch,
+                    client_request_id=st.session_state["loomloom_client_request_id"],
+                    listing_version_id=quote_result.listing_version_id,
+                    confirm=True,
+                )
+            except (loomloom.LoomLoomError, ValueError) as exc:
+                logger.warning(f"failed to execute LoomLoom scripts: error={exc}")
+                st.error(str(exc))
+            else:
+                st.session_state["loomloom_run_id"] = execution.run_id
+                st.session_state["loomloom_run_status"] = "running"
+                st.session_state["loomloom_poll_paused"] = False
+                # 一次报价只允许启动一次付费批次。后台状态只依赖 run_id，提交
+                # 后即可丢弃报价与幂等请求 ID；失败后用户需要重新报价再重试。
+                st.session_state["loomloom_script_batch"] = None
+                st.session_state["loomloom_script_quote"] = None
+                st.session_state["loomloom_script_input_signature"] = ""
+                st.session_state["loomloom_client_request_id"] = ""
+                logger.info(
+                    f"LoomLoom script run submitted: run_id={execution.run_id}, "
+                    f"tasks={len(batch.input_rows)}"
+                )
+                st.toast(tr("LoomLoom Run Submitted"))
+
+    run_error = str(st.session_state.get("loomloom_run_error", "") or "").strip()
+    if run_error:
+        st.error(tr("LoomLoom Run Failed").format(error=run_error))
+    run_id = str(st.session_state.get("loomloom_run_id", "") or "").strip()
+    if run_id and st.session_state.get("loomloom_poll_paused", False):
+        retry_col, stop_col = st.columns(2)
+        if retry_col.button(
+            tr("Resume LoomLoom Status Check"),
+            key="loomloom_resume_status_check",
+            use_container_width=True,
+            type="secondary",
+        ):
+            st.session_state["loomloom_run_error"] = ""
+            st.session_state["loomloom_poll_failure_count"] = 0
+            st.session_state["loomloom_poll_retry_after"] = 0.0
+            st.session_state["loomloom_poll_paused"] = False
+            st.rerun(scope="app")
+        if stop_col.button(
+            tr("Stop Tracking LoomLoom Run"),
+            key="loomloom_stop_tracking_run",
+            use_container_width=True,
+            type="secondary",
+            help=tr("Stop Tracking LoomLoom Run Help"),
+        ):
+            # 这里只停止本地状态查询，不声称取消远端执行。用户确认放弃跟踪后
+            # 才清理 run_id，下一次付费运行仍需重新报价和确认。
+            st.session_state["loomloom_run_id"] = ""
+            st.session_state["loomloom_run_error"] = ""
+            st.session_state["loomloom_poll_paused"] = False
+            st.rerun(scope="app")
+    # 只有真实运行中的批次才启动两秒轮询，报价阶段和结果展示阶段不创建
+    # 定时 fragment，避免用户停留在页面时产生无意义的网络请求和 rerun。
+    if run_id and not st.session_state.get("loomloom_poll_paused", False):
+        _render_loomloom_run_progress()
+    _render_loomloom_candidates()
 
 
 def _render_script_settings(panel, params):
@@ -2455,24 +3833,48 @@ def _render_script_settings(panel, params):
             selected_language_code = stable_selectbox(
                 tr("Script Language"),
                 options=[value for _, value in video_languages],
-                default_value="",
+                default_value=_saved_ui_choice(
+                    "video_language",
+                    [value for _, value in video_languages],
+                    "",
+                ),
                 key="script_language_select",
                 format_func=lambda value: dict(
                     (v, label) for label, v in video_languages
                 )[value],
             )
             params.video_language = selected_language_code
+            _set_runtime_config("ui", "video_language", params.video_language)
 
             # 使用带 key 的局部容器限定折叠入口样式，保持 expander 的原生交互，
             # 同时避免样式误伤页面顶部的“基础设置”等其他折叠区域。
             with st.container(key="advanced_settings_script"):
                 with st.expander(tr("Advanced Script Settings"), expanded=False):
-                    st.session_state.setdefault("paragraph_number_input", 1)
+                    script_backend_options = ["local", "loomloom"]
+                    script_backend_labels = {
+                        "local": tr("Local LLM Script Generation"),
+                        "loomloom": tr("Shengsuan Cloud Batch Script Generation"),
+                    }
+                    script_generation_backend = stable_selectbox(
+                        tr("Script Generation Method"),
+                        options=script_backend_options,
+                        default_value=_effective_script_generation_backend(),
+                        key="script_generation_backend_select",
+                        format_func=lambda value: script_backend_labels[value],
+                        help=tr("Script Generation Method Help"),
+                    )
+                    _set_runtime_config(
+                        "app", "script_generation_backend", script_generation_backend
+                    )
+
                     params.paragraph_number = st.slider(
                         tr("Script Paragraph Number"),
                         min_value=llm.MIN_SCRIPT_PARAGRAPH_NUMBER,
                         max_value=llm.MAX_SCRIPT_PARAGRAPH_NUMBER,
                         key="paragraph_number_input",
+                    )
+                    _set_runtime_config(
+                        "ui", "paragraph_number", params.paragraph_number
                     )
                     params.video_script_prompt = st.text_area(
                         tr("Custom Script Requirements"),
@@ -2481,6 +3883,9 @@ def _render_script_settings(panel, params):
                         placeholder=tr("Custom Script Requirements Placeholder"),
                         key="video_script_prompt",
                     ).strip()
+                    _set_runtime_config(
+                        "ui", "video_script_prompt", params.video_script_prompt
+                    )
 
                     system_prompt = st.text_area(
                         tr("Custom System Prompt"),
@@ -2494,6 +3899,9 @@ def _render_script_settings(panel, params):
                         ""
                         if system_prompt == llm.DEFAULT_SCRIPT_SYSTEM_PROMPT.strip()
                         else system_prompt
+                    )
+                    _set_runtime_config(
+                        "ui", "custom_system_prompt", params.custom_system_prompt
                     )
 
                     restore_prompt_col, preview_prompt_col = st.columns(2)
@@ -2521,56 +3929,22 @@ def _render_script_settings(panel, params):
                             )
                         )
 
-            if st.button(
-                tr("Generate Video Script and Keywords"),
-                key="auto_generate_script",
-                use_container_width=True,
-                type="secondary",
-                icon=":material/auto_awesome:",
-            ):
-                if not params.video_subject:
-                    # 视频主题是脚本生成的必要输入，提前拦截可以避免无意义的模型调用。
-                    st.toast(tr("Please Enter the Video Subject First"))
-                    st.warning(tr("Please Enter the Video Subject First"))
-                else:
-                    with st.spinner(tr("Generating Video Script and Keywords")):
-
-                        def generate_script_and_terms(app_config_snapshot):
-                            script = llm.generate_script(
-                                video_subject=params.video_subject,
-                                language=params.video_language,
-                                paragraph_number=params.paragraph_number,
-                                video_script_prompt=params.video_script_prompt,
-                                custom_system_prompt=params.custom_system_prompt,
-                                app_config=app_config_snapshot,
-                            )
-                            terms = llm.generate_terms(
-                                params.video_subject,
-                                script,
-                                amount=8 if params.match_materials_to_script else 5,
-                                match_script_order=params.match_materials_to_script,
-                                app_config=app_config_snapshot,
-                            )
-                            return script, terms
-
-                        script, terms = _run_llm_read_operation(
-                            "generate_script_and_terms",
-                            generate_script_and_terms,
-                        )
-                        if "Error: " in script:
-                            st.error(tr(script))
-                        elif "Error: " in terms:
-                            st.error(tr(terms))
-                        else:
-                            st.session_state["video_script"] = script
-                            st.session_state["video_terms"] = ", ".join(terms)
+            if _effective_script_generation_backend() == "loomloom":
+                _render_loomloom_script_generation(params)
+            else:
+                _render_local_script_generation(params)
             params.video_script = st.text_area(
                 tr("Video Script"),
                 help=tr("Video Script Help"),
                 height=180,
                 key="video_script",
             )
-            if st.button(
+            using_loomloom_scripts = (
+                _effective_script_generation_backend() == "loomloom"
+            )
+            if using_loomloom_scripts:
+                st.caption(tr("LoomLoom Video Terms Reuse Help"))
+            elif st.button(
                 tr("Generate Video Keywords"),
                 key="auto_generate_terms",
                 use_container_width=True,
@@ -2619,6 +3993,8 @@ def _render_video_settings(panel, params):
                 (tr("Pexels"), "pexels"),
                 (tr("Pixabay"), "pixabay"),
                 (tr("Coverr"), "coverr"),
+                (tr("WaveSpeed AI Video"), "wavespeed"),
+                (tr("Shengsuan Cloud AI Video"), "loomloom"),
                 (tr("Local file"), "local"),
             ]
 
@@ -2626,14 +4002,22 @@ def _render_video_settings(panel, params):
                 config.app.get("video_source", "pexels")
             ]
             source_labels = dict((value, label) for label, value in video_sources)
-            params.video_sources = st.multiselect(
-                tr("Video Source"),
-                options=[value for _, value in video_sources],
-                default=[source for source in saved_video_sources if source in source_labels],
-                key=localized_widget_key("video_sources_select"),
-                format_func=lambda value: source_labels[value],
-            )
+            video_sources_widget_key = localized_widget_key("video_sources_select")
+            multiselect_args = {
+                "label": tr("Video Source"),
+                "options": [value for _, value in video_sources],
+                "key": video_sources_widget_key,
+                "format_func": lambda value: source_labels[value],
+            }
+            if video_sources_widget_key not in st.session_state:
+                multiselect_args["default"] = [
+                    source for source in saved_video_sources if source in source_labels
+                ]
+            params.video_sources = st.multiselect(**multiselect_args)
             _set_runtime_config("app", "video_sources", params.video_sources)
+
+            if params.video_source == "wavespeed":
+                st.caption(tr("WaveSpeed AI Video Help"))
 
             if "local" in params.video_sources:
                 # Streamlit 的文件类型校验对扩展名大小写敏感，这里同时放行大小写两种形式。
@@ -2656,7 +4040,11 @@ def _render_video_settings(panel, params):
             selected_concat_mode = stable_selectbox(
                 tr("Video Concat Mode"),
                 options=[value for _, value in video_concat_modes],
-                default_value=VideoConcatMode.random.value,
+                default_value=_saved_ui_choice(
+                    "video_concat_mode",
+                    [value for _, value in video_concat_modes],
+                    VideoConcatMode.random.value,
+                ),
                 key="video_concat_mode_select",
                 format_func=lambda value: dict(
                     (v, label) for label, v in video_concat_modes
@@ -2676,6 +4064,12 @@ def _render_video_settings(panel, params):
                 "match_materials_to_script",
                 params.match_materials_to_script,
             )
+            # 顺序匹配开启时，sequential 是派生出的强制值，不应覆盖用户在关闭
+            # 该功能时选择的拼接偏好；关闭后仍能恢复此前的 random/sequential。
+            if not params.match_materials_to_script:
+                _set_runtime_config(
+                    "ui", "video_concat_mode", params.video_concat_mode.value
+                )
 
             # 视频转场模式
             video_transition_modes = [
@@ -2691,13 +4085,22 @@ def _render_video_settings(panel, params):
             selected_transition_mode = stable_selectbox(
                 tr("Video Transition Mode"),
                 options=[value for _, value in video_transition_modes],
-                default_value=VideoTransitionMode.none.value,
+                default_value=_saved_ui_choice(
+                    "video_transition_mode",
+                    [value for _, value in video_transition_modes],
+                    VideoTransitionMode.none.value,
+                ),
                 key="video_transition_mode_select",
                 format_func=lambda value: dict(
                     (v, label) for label, v in video_transition_modes
                 )[value],
             )
             params.video_transition_mode = VideoTransitionMode(selected_transition_mode)
+            _set_runtime_config(
+                "ui",
+                "video_transition_mode",
+                params.video_transition_mode.value,
+            )
 
             video_aspect_ratios = [
                 (tr("Portrait"), VideoAspect.portrait.value),
@@ -2711,30 +4114,48 @@ def _render_video_settings(panel, params):
             #     下次回到同一 source 时尊重用户选择,不会再被强制覆盖。
             primary_source = params.video_sources[0] if params.video_sources else "pexels"
             default_aspect_index = 1 if primary_source in {"coverr"} else 0
+            video_aspect_values = [value for _, value in video_aspect_ratios]
+            video_aspect_config_key = f"video_aspect_{primary_source}"
             selected_aspect_ratio = stable_selectbox(
                 tr("Video Ratio"),
-                options=[value for _, value in video_aspect_ratios],
-                default_value=video_aspect_ratios[default_aspect_index][1],
+                options=video_aspect_values,
+                default_value=_saved_ui_choice(
+                    video_aspect_config_key,
+                    video_aspect_values,
+                    video_aspect_ratios[default_aspect_index][1],
+                ),
                 key=f"video_aspect_for_{primary_source}",
                 format_func=lambda value: dict(
                     (v, label) for label, v in video_aspect_ratios
                 )[value],
             )
             params.video_aspect = VideoAspect(selected_aspect_ratio)
+            _set_runtime_config(
+                "ui", video_aspect_config_key, params.video_aspect.value
+            )
 
+            video_clip_durations = [2, 3, 4, 5, 6, 7, 8, 9, 10]
             params.video_clip_duration = stable_selectbox(
                 tr("Clip Duration"),
-                options=[2, 3, 4, 5, 6, 7, 8, 9, 10],
-                default_value=3,
+                options=video_clip_durations,
+                default_value=_saved_ui_choice(
+                    "video_clip_duration", video_clip_durations, 3
+                ),
                 key="video_clip_duration_select",
                 help=tr("Clip Duration Help"),
+            )
+            _set_runtime_config(
+                "ui", "video_clip_duration", params.video_clip_duration
             )
             clip_speed_key = localized_widget_key("video_clip_speed_slider")
             # session_state 可能来自旧任务、API 参数或旧版页面状态。控件创建前
             # 统一归一化，既保留合法选择，也确保 slider 始终收到 0.5～2.0
             # 范围内的有限浮点数。
             st.session_state[clip_speed_key] = utils.normalize_clip_speed(
-                st.session_state.get(clip_speed_key, 1.0)
+                st.session_state.get(
+                    clip_speed_key,
+                    _saved_ui_number("video_clip_speed", 1.0, 0.5, 2.0),
+                )
             )
             params.video_clip_speed = st.slider(
                 tr("Clip Speed"),
@@ -2745,12 +4166,17 @@ def _render_video_settings(panel, params):
                 key=clip_speed_key,
                 help=tr("Clip Speed Help"),
             )
+            _set_runtime_config("ui", "video_clip_speed", params.video_clip_speed)
+            video_count_options = [1, 2, 3, 4, 5]
             params.video_count = stable_selectbox(
                 tr("Number of Videos Generated Simultaneously"),
-                options=[1, 2, 3, 4, 5],
-                default_value=1,
+                options=video_count_options,
+                default_value=_saved_ui_choice(
+                    "video_count", video_count_options, 1
+                ),
                 key="video_count_select",
             )
+            _set_runtime_config("ui", "video_count", params.video_count)
 
             video_codec_options = [
                 (tr("Default Video Encoder"), DEFAULT_VIDEO_CODEC_OPTION),
@@ -2784,7 +4210,45 @@ def _render_video_settings(panel, params):
                 _delete_runtime_config("app", "video_codec")
             else:
                 _set_runtime_config("app", "video_codec", selected_video_codec)
+
+            if params.video_source == "loomloom":
+                _render_loomloom_video_settings(params)
+
+            if params.video_source == "wavespeed":
+                _render_wavespeed_video_settings(params)
     return uploaded_files
+
+
+def _render_wavespeed_video_settings(params):
+    """
+    渲染 WaveSpeed 生成数量估算与计费确认。
+
+    生成按条计费，提交前必须让用户看到大致会生成多少段。估算完全在本地
+    完成：用配音时长估算区间除以片段时长得到需要覆盖的片段数。素材流程
+    本身按需逐段生成、凑够所需时长即停，因此实际生成数以运行时为准，
+    估算只用于量级提示，不参与任务执行。
+    """
+    clip_duration = max(int(params.video_clip_duration or 1), 1)
+    video_count = max(int(params.video_count or 1), 1)
+    estimated_range = _estimate_voiceover_duration_range(
+        str(params.video_script or ""),
+        params.voice_rate,
+    )
+    if estimated_range:
+        min_clips = max(math.ceil(estimated_range[0] * video_count / clip_duration), 1)
+        max_clips = max(
+            math.ceil(estimated_range[1] * video_count / clip_duration), min_clips
+        )
+        st.warning(
+            tr("WaveSpeed Billing Notice").format(min=min_clips, max=max_clips)
+        )
+    else:
+        st.warning(tr("WaveSpeed Billing Notice Without Script"))
+    st.checkbox(
+        tr("Confirm WaveSpeed Charge"),
+        key="wavespeed_confirm_charge",
+        help=tr("Confirm WaveSpeed Charge Help"),
+    )
 
 
 def _estimate_voiceover_duration_range(
@@ -3105,9 +4569,19 @@ def _render_voice_preview(params, friendly_names, selected_tts_server, voice_nam
         and cached_preview.get("fingerprint") in valid_fingerprints
         and cached_preview.get("audio_bytes")
     ):
+        # 只在用户本次明确点击“试听音色”时自动播放。Streamlit 的其它控件
+        # 也会触发页面 rerun；如果对缓存音频永久开启 autoplay，修改任意设置
+        # 都可能让旧试听从头播放。完整试听继续保留手动播放，避免较长音频在
+        # 生成完成后意外打断用户。
+        should_autoplay = bool(
+            short_preview_requested
+            and cached_preview.get("preview_type") == "sample"
+            and cached_preview.get("fingerprint") == sample_fingerprint
+        )
         st.audio(
             cached_preview["audio_bytes"],
             format=cached_preview.get("mime_type", "audio/mp3"),
+            autoplay=should_autoplay,
         )
         if cached_preview.get("preview_type") == "full":
             duration = cached_preview.get("duration")
@@ -3191,9 +4665,7 @@ def _sync_minimax_tts_api_key_input():
     widget_key = "minimax_tts_api_key_input"
     configured_key = str(config.minimax_tts.get("api_key", "") or "").strip()
     shared_key = str(
-        config.app.get("minimax_api_key", "")
-        or os.getenv("MINIMAX_API_KEY", "")
-        or ""
+        config.app.get("minimax_api_key", "") or os.getenv("MINIMAX_API_KEY", "") or ""
     ).strip()
     effective_key = configured_key or shared_key
     had_widget_state = widget_key in st.session_state
@@ -3261,7 +4733,9 @@ def _render_minimax_tts_settings() -> tuple[list[str], dict[str, str]]:
     if dedicated_key:
         _set_runtime_config("minimax_tts", "base_url", minimax_tts_base_url)
 
-    configured_model = config.minimax_tts.get("model_id", voice.MINIMAX_TTS_DEFAULT_MODEL)
+    configured_model = config.minimax_tts.get(
+        "model_id", voice.MINIMAX_TTS_DEFAULT_MODEL
+    )
     if configured_model not in voice.MINIMAX_TTS_MODELS:
         configured_model = voice.MINIMAX_TTS_DEFAULT_MODEL
     minimax_tts_model = stable_selectbox(
@@ -3295,9 +4769,7 @@ def _render_minimax_tts_settings() -> tuple[list[str], dict[str, str]]:
                 minimax_tts_base_url,
                 available_voices,
             )
-            st.success(
-                tr("MiniMax Voices Loaded").format(count=len(available_voices))
-            )
+            st.success(tr("MiniMax Voices Loaded").format(count=len(available_voices)))
 
     available_voices = _get_cached_minimax_voices(
         effective_api_key,
@@ -3380,6 +4852,7 @@ def _render_elevenlabs_api_key_input(label_key):
 def _render_background_music_settings(params, elevenlabs_api_key_rendered=False):
     """渲染背景音乐来源与音量设置，并返回本次待保存的上传文件。"""
     uploaded_bgm_file = None
+    previous_bgm_type = st.session_state.get("last_rendered_bgm_type")
     st.divider()
     bgm_options = [
         (tr("No Background Music"), ""),
@@ -3391,11 +4864,16 @@ def _render_background_music_settings(params, elevenlabs_api_key_rendered=False)
     selected_bgm_type = stable_selectbox(
         tr("Background Music Source"),
         options=[value for _, value in bgm_options],
-        default_value="random",
+        default_value=_saved_ui_choice(
+            "bgm_type",
+            [value for _, value in bgm_options],
+            "random",
+        ),
         key="bgm_type_select",
         format_func=lambda value: dict((v, label) for label, v in bgm_options)[value],
     )
     params.bgm_type = selected_bgm_type
+    _set_runtime_config("ui", "bgm_type", params.bgm_type)
     if params.bgm_type == "sonilo":
         configured_key = str(config.app.get("sonilo_api_key", "") or "").strip()
         effective_key = configured_key or os.getenv("SONILO_API_KEY", "").strip()
@@ -3418,14 +4896,16 @@ def _render_background_music_settings(params, elevenlabs_api_key_rendered=False)
         else:
             _render_elevenlabs_api_key_input("ElevenLabs Music API Key")
 
+    bgm_volume_options = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
     params.bgm_volume = stable_selectbox(
         tr("Background Music Volume"),
-        options=[0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
-        default_value=0.2,
+        options=bgm_volume_options,
+        default_value=_saved_ui_choice("bgm_volume", bgm_volume_options, 0.2),
         key="bgm_volume_select",
         format_func=lambda value: f"{int(value * 100)}%",
         disabled=not params.bgm_type,
     )
+    _set_runtime_config("ui", "bgm_volume", params.bgm_volume)
     bgm_enabled = bgm_service.should_use_bgm(params.bgm_type, params.bgm_volume)
 
     if params.bgm_type == "custom":
@@ -3518,10 +4998,20 @@ def _render_background_music_settings(params, elevenlabs_api_key_rendered=False)
                 st.info(f"{tr('Background Music Ready')}: {safe_name}")
                 params.bgm_file = safe_name
 
+        # Streamlit 会在条件控件暂时不渲染时清理其 widget state。
+        # 从其它 BGM 来源切回时用已持久化值恢复；同一来源下
+        # 用户主动清空时 previous_bgm_type 不变，因此不会被旧值反弹。
+        if previous_bgm_type != "custom":
+            st.session_state["custom_bgm_file_input"] = _saved_ui_text(
+                "custom_bgm_file"
+            )
         custom_bgm_file = st.text_input(
             tr("Custom Background Music File"),
             key="custom_bgm_file_input",
             disabled=uploaded_bgm_file is not None,
+        )
+        _set_runtime_config(
+            "ui", "custom_bgm_file", custom_bgm_file.strip()
         )
         if uploaded_bgm_file is None and custom_bgm_file and bgm_enabled:
             # 文件名由服务层映射到 storage/bgm 或 resource/songs 后校验，
@@ -3533,12 +5023,20 @@ def _render_background_music_settings(params, elevenlabs_api_key_rendered=False)
             params.bgm_file = ""
 
     if params.bgm_type == "sonilo":
+        if previous_bgm_type != "sonilo":
+            st.session_state["sonilo_bgm_prompt_input"] = _saved_ui_text(
+                "sonilo_bgm_prompt",
+                max_length=sonilo_service.MAX_PROMPT_LENGTH,
+            )
         params.video_music_prompt = st.text_input(
             tr("Sonilo Music Prompt"),
             key="sonilo_bgm_prompt_input",
             max_chars=sonilo_service.MAX_PROMPT_LENGTH,
             help=tr("Sonilo Music Prompt Help"),
         ).strip()
+        _set_runtime_config(
+            "ui", "sonilo_bgm_prompt", params.video_music_prompt
+        )
         if params.video_count > 1:
             st.warning(tr("Sonilo Multiple Videos Warning"))
         if st.button(
@@ -3554,12 +5052,20 @@ def _render_background_music_settings(params, elevenlabs_api_key_rendered=False)
             else:
                 st.success(tr("Sonilo Connection Test Succeeded"))
     elif params.bgm_type == "elevenlabs":
+        if previous_bgm_type != "elevenlabs":
+            st.session_state["elevenlabs_music_prompt_input"] = _saved_ui_text(
+                "elevenlabs_music_prompt",
+                max_length=elevenlabs_music_service.MAX_PROMPT_LENGTH,
+            )
         params.video_music_prompt = st.text_input(
             tr("ElevenLabs Music Prompt"),
             key="elevenlabs_music_prompt_input",
             max_chars=elevenlabs_music_service.MAX_PROMPT_LENGTH,
             help=tr("ElevenLabs Music Prompt Help"),
         ).strip()
+        _set_runtime_config(
+            "ui", "elevenlabs_music_prompt", params.video_music_prompt
+        )
         if params.video_count > 1:
             st.warning(tr("ElevenLabs Multiple Videos Warning"))
         if st.button(
@@ -3586,6 +5092,7 @@ def _render_background_music_settings(params, elevenlabs_api_key_rendered=False)
         and not elevenlabs_music_service.is_enabled()
     ):
         st.warning(tr("ElevenLabs API Key Required"))
+    st.session_state["last_rendered_bgm_type"] = params.bgm_type
     return uploaded_bgm_file
 
 
@@ -3637,6 +5144,7 @@ def _render_audio_settings(panel, params):
                 ("minimax-tts", "MiniMax TTS"),
                 ("elevenlabs", "ElevenLabs TTS"),
                 ("chatterbox", "Chatterbox TTS"),
+                ("fish_audio", "Fish Audio TTS"),
             ]
 
             tts_server_values = [server_value for server_value, _ in tts_servers]
@@ -3671,9 +5179,7 @@ def _render_audio_settings(panel, params):
             minimax_voices = []
             minimax_voice_labels = {}
             if tts_mode_enabled and selected_tts_server == "minimax-tts":
-                minimax_voices, minimax_voice_labels = (
-                    _render_minimax_tts_settings()
-                )
+                minimax_voices, minimax_voice_labels = _render_minimax_tts_settings()
 
             # 根据选择的TTS服务器获取声音列表
             filtered_voices = []
@@ -3708,6 +5214,8 @@ def _render_audio_settings(panel, params):
                 # 自托管 Chatterbox 服务的预置音色（来自 [chatterbox] voices 配置）
                 _sync_chatterbox_config_from_session_state()
                 filtered_voices = voice.get_chatterbox_voices()
+            elif selected_tts_server == "fish_audio":
+                filtered_voices = voice.get_fish_audio_voices()
             else:
                 # 获取Azure的声音列表
                 all_voices = voice.get_all_azure_voices(filter_locals=None)
@@ -3734,6 +5242,13 @@ def _render_audio_settings(panel, params):
                     return name.replace("-Female", "").replace("-Male", "")
                 if voice.is_minimax_voice(v):
                     return minimax_voice_labels.get(v, v.split(":", 1)[1])
+                if voice.is_fish_audio_voice(v):
+                    parts = v.split(":", 2)
+                    display_name = parts[2] if len(parts) >= 3 else v
+                    return (
+                        display_name.replace("Female", tr("Female"))
+                        .replace("Male", tr("Male"))
+                    )
                 return (
                     v.replace("Female", tr("Female"))
                     .replace("Male", tr("Male"))
@@ -3741,6 +5256,23 @@ def _render_audio_settings(panel, params):
                 )
 
             friendly_names = {v: _friendly(v) for v in filtered_voices}
+
+            # Gemini 旧目录把推测的性别放在值里（例如 Charon-Male）。按基础
+            # voice name 映射到新的官方风格值，升级后继续保留用户原来的音色。
+            if (
+                selected_tts_server == "gemini-tts"
+                and saved_voice_name not in friendly_names
+            ):
+                saved_gemini_voice = voice.parse_gemini_voice_name(saved_voice_name)
+                saved_voice_name = next(
+                    (
+                        candidate
+                        for candidate in filtered_voices
+                        if voice.parse_gemini_voice_name(candidate)
+                        == saved_gemini_voice
+                    ),
+                    saved_voice_name,
+                )
 
             saved_voice_name_index = 0
 
@@ -3900,6 +5432,44 @@ def _render_audio_settings(panel, params):
                 )
                 _set_runtime_config("elevenlabs", "model_id", elevenlabs_model)
 
+            # Fish Audio API settings section
+            if tts_mode_enabled and (
+                selected_tts_server == "fish_audio"
+                or (voice_name and voice.is_fish_audio_voice(voice_name))
+            ):
+                saved_fish_api_key = (
+                    config.fish_audio.get("api_key", "")
+                    if hasattr(config, "fish_audio") and isinstance(config.fish_audio, dict)
+                    else ""
+                )
+                fish_audio_api_key = st.text_input(
+                    tr("Fish Audio API Key"),
+                    value=saved_fish_api_key,
+                    type="password",
+                    key="fish_audio_api_key_input",
+                )
+                _set_runtime_config("fish_audio", "api_key", fish_audio_api_key)
+
+                _fish_audio_models = [
+                    "s2.1-pro-free",
+                    "s2.1-pro",
+                    "s2-pro",
+                ]
+                saved_fish_model = (
+                    config.fish_audio.get("model", "s2.1-pro-free")
+                    if hasattr(config, "fish_audio") and isinstance(config.fish_audio, dict)
+                    else "s2.1-pro-free"
+                )
+                if saved_fish_model not in _fish_audio_models:
+                    saved_fish_model = "s2.1-pro-free"
+                fish_model = stable_selectbox(
+                    tr("Fish Audio Model"),
+                    options=_fish_audio_models,
+                    default_value=saved_fish_model,
+                    key="fish_audio_model_select",
+                )
+                _set_runtime_config("fish_audio", "model", fish_model)
+
             # Chatterbox API settings section (self-hosted, OpenAI-compatible)
             if tts_mode_enabled and (
                 selected_tts_server == "chatterbox"
@@ -3961,14 +5531,18 @@ def _render_audio_settings(panel, params):
             params.voice_volume = 1.0
             params.voice_rate = 1.0
             uploaded_audio_file = None
+            voice_volume_options = [0.6, 0.8, 1.0, 1.2, 1.5, 2.0, 3.0, 4.0, 5.0]
+            voice_rate_options = [0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.5, 1.8, 2.0]
 
             if tts_mode_enabled:
                 voice_control_cols = st.columns(2)
                 with voice_control_cols[0]:
                     params.voice_volume = stable_selectbox(
                         tr("Voiceover Volume"),
-                        options=[0.6, 0.8, 1.0, 1.2, 1.5, 2.0, 3.0, 4.0, 5.0],
-                        default_value=1.0,
+                        options=voice_volume_options,
+                        default_value=_saved_ui_choice(
+                            "voice_volume", voice_volume_options, 1.0
+                        ),
                         key="voice_volume_select",
                         format_func=lambda value: f"{int(value * 100)}%",
                         help=tr("Voiceover Volume Help"),
@@ -3977,12 +5551,16 @@ def _render_audio_settings(panel, params):
                 with voice_control_cols[1]:
                     params.voice_rate = stable_selectbox(
                         tr("Voiceover Speed"),
-                        options=[0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.5, 1.8, 2.0],
-                        default_value=1.0,
+                        options=voice_rate_options,
+                        default_value=_saved_ui_choice(
+                            "voice_rate", voice_rate_options, 1.0
+                        ),
                         key="voice_rate_select",
                         format_func=lambda value: f"{value:.1f}×",
                         help=tr("Voiceover Speed Help"),
                     )
+                _set_runtime_config("ui", "voice_volume", params.voice_volume)
+                _set_runtime_config("ui", "voice_rate", params.voice_rate)
 
                 # 试听必须位于音量和语速控件之后，确保调用使用当前控件值。
                 _render_voice_preview(
@@ -4005,12 +5583,15 @@ def _render_audio_settings(panel, params):
                 )
                 params.voice_volume = stable_selectbox(
                     tr("Voiceover Volume"),
-                    options=[0.6, 0.8, 1.0, 1.2, 1.5, 2.0, 3.0, 4.0, 5.0],
-                    default_value=1.0,
+                    options=voice_volume_options,
+                    default_value=_saved_ui_choice(
+                        "voice_volume", voice_volume_options, 1.0
+                    ),
                     key="voice_volume_select",
                     format_func=lambda value: f"{int(value * 100)}%",
                     help=tr("Voiceover Volume Help"),
                 )
+                _set_runtime_config("ui", "voice_volume", params.voice_volume)
                 if uploaded_audio_file:
                     st.audio(uploaded_audio_file, format="audio/mp3")
                     st.info(
@@ -4032,12 +5613,16 @@ def _render_subtitle_settings(panel, params):
             st.write(tr("Subtitle Settings"))
             st.session_state.setdefault(
                 "subtitle_enabled_checkbox",
-                DEFAULT_SUBTITLE_SETTINGS["subtitle_enabled"],
+                _saved_ui_bool(
+                    "subtitle_enabled",
+                    DEFAULT_SUBTITLE_SETTINGS["subtitle_enabled"],
+                ),
             )
             params.subtitle_enabled = st.checkbox(
                 tr("Enable Subtitles"),
                 key="subtitle_enabled_checkbox",
             )
+            _set_runtime_config("ui", "subtitle_enabled", params.subtitle_enabled)
             subtitle_settings_disabled = not params.subtitle_enabled
             font_names = get_all_fonts()
             saved_font_name = config.ui.get(
@@ -4137,16 +5722,26 @@ def _render_subtitle_settings(panel, params):
             stroke_cols = st.columns([0.42, 0.58])
             with stroke_cols[0]:
                 st.session_state.setdefault(
-                    "stroke_color_picker", DEFAULT_SUBTITLE_SETTINGS["stroke_color"]
+                    "stroke_color_picker",
+                    _saved_ui_color(
+                        "stroke_color", DEFAULT_SUBTITLE_SETTINGS["stroke_color"]
+                    ),
                 )
                 params.stroke_color = st.color_picker(
                     tr("Stroke Color"),
                     key="stroke_color_picker",
                     disabled=subtitle_settings_disabled,
                 )
+                _set_runtime_config("ui", "stroke_color", params.stroke_color)
             with stroke_cols[1]:
                 st.session_state.setdefault(
-                    "stroke_width_slider", DEFAULT_SUBTITLE_SETTINGS["stroke_width"]
+                    "stroke_width_slider",
+                    _saved_ui_number(
+                        "stroke_width",
+                        DEFAULT_SUBTITLE_SETTINGS["stroke_width"],
+                        0.0,
+                        10.0,
+                    ),
                 )
                 params.stroke_width = st.slider(
                     tr("Stroke Width"),
@@ -4155,6 +5750,7 @@ def _render_subtitle_settings(panel, params):
                     key="stroke_width_slider",
                     disabled=subtitle_settings_disabled,
                 )
+                _set_runtime_config("ui", "stroke_width", params.stroke_width)
 
             # 背景开关的本地化名称普遍比颜色标签更长，因此让开关占据略多空间。
             subtitle_bg_cols = st.columns([0.55, 0.45])
@@ -4299,6 +5895,8 @@ def _render_generation_controls(
         # 已经得到明确处理，清除标记，避免后续普通生成继续显示旧提示。
         st.session_state.pop("task_restore_upload_requirements", None)
 
+    _render_settings_transfer(params)
+
     start_button = st.button(
         tr("Generate Video"),
         use_container_width=True,
@@ -4319,8 +5917,17 @@ def _render_generation_controls(
             st.error(tr("Video Script and Subject Cannot Both Be Empty"))
             st.stop()
 
-        valid_video_sources = {"pexels", "pixabay", "coverr", "local"}
-        if not params.video_sources or not set(params.video_sources).issubset(valid_video_sources):
+        valid_video_sources = {
+            "pexels",
+            "pixabay",
+            "coverr",
+            "wavespeed",
+            "loomloom",
+            "local",
+        }
+        if not params.video_sources or not set(params.video_sources).issubset(
+            valid_video_sources
+        ):
             _remove_active_generation_task(task_id)
             st.error(tr("Please Select a Valid Video Source"))
             st.stop()
@@ -4345,6 +5952,58 @@ def _render_generation_controls(
             _remove_active_generation_task(task_id)
             st.error(tr("Please Enter the Coverr API Key"))
             st.stop()
+
+        if params.video_source == "wavespeed" and not config.app.get(
+            "wavespeed_api_keys", ""
+        ):
+            _remove_active_generation_task(task_id)
+            st.error(tr("Please Enter the WaveSpeed API Key"))
+            st.stop()
+
+        if params.video_source == "wavespeed" and not st.session_state.get(
+            "wavespeed_confirm_charge", False
+        ):
+            _remove_active_generation_task(task_id)
+            st.error(tr("Confirm WaveSpeed Charge Required"))
+            st.stop()
+
+        loomloom_video_request = None
+        if params.video_source == "loomloom":
+            current_batch, current_signature = _current_loomloom_video_quote_context(
+                params
+            )
+            quoted_batch = st.session_state.get("loomloom_video_batch")
+            quote_result = st.session_state.get("loomloom_video_quote")
+            quote_is_current = bool(
+                current_batch is not None
+                and isinstance(quoted_batch, loomloom.LoomLoomVideoBatch)
+                and quote_result is not None
+                and st.session_state.get("loomloom_video_input_signature")
+                == current_signature
+            )
+            if not quote_is_current:
+                _remove_active_generation_task(task_id)
+                st.error(tr("AI Video Quote Required"))
+                st.stop()
+            if not st.session_state.get("loomloom_video_confirm_charge", False):
+                _remove_active_generation_task(task_id)
+                st.error(tr("Confirm AI Video Charge Required"))
+                st.stop()
+            try:
+                video_backend = _create_loomloom_video_backend()
+                loomloom_video_request = loomloom.LoomLoomConfirmedVideoRequest(
+                    settings=video_backend.settings,
+                    batch=current_batch,
+                    listing_version_id=quote_result.listing_version_id,
+                    client_request_id=st.session_state[
+                        "loomloom_video_client_request_id"
+                    ],
+                )
+                loomloom_video_request.validate()
+            except (loomloom.LoomLoomError, ValueError) as exc:
+                _remove_active_generation_task(task_id)
+                st.error(str(exc))
+                st.stop()
 
         if (
             params.bgm_type == "sonilo"
@@ -4501,7 +6160,15 @@ def _render_generation_controls(
                 params=params,
                 capture_logs=not config.ui.get("hide_log", False),
                 voice_preview=reusable_voice_preview,
+                loomloom_video_request=loomloom_video_request,
             )
+            if loomloom_video_request is not None:
+                # 一个报价只允许提交一次。后台请求自带稳定幂等 ID；提交成功后
+                # 清除页面报价，下一次生成必须重新询价和确认。
+                st.session_state["loomloom_video_batch"] = None
+                st.session_state["loomloom_video_quote"] = None
+                st.session_state["loomloom_video_input_signature"] = ""
+                st.session_state["loomloom_video_client_request_id"] = ""
         except Exception:
             _remove_active_generation_task(task_id)
             st.error(tr("Video Generation Failed"))
@@ -4534,6 +6201,9 @@ def _render_application():
         )
         if delete_candidate:
             _render_preset_delete_dialog(delete_candidate)
+
+    if _apply_pending_settings_preset():
+        st.success(tr("Settings Preset Imported"))
 
     restore_applied = _apply_pending_task_restore()
     restore_candidate_id = st.session_state.get("task_restore_candidate_id")

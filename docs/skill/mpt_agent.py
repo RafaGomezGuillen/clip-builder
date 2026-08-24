@@ -38,14 +38,14 @@ PEXELS_API_KEY_HELP_URL = (
 RECOMMENDED_LLM_PROVIDERS = {
     "moonshot": (
         "Kimi / Moonshot AI",
-        "https://platform.kimi.com?track_id=track-2f5441d6ffd84c509dd079d78e9db5dc&aff=moneyprinterturbo",
+        "https://platform.kimi.com?track_id=track-2f5441d6ffd84c509dd079d78e9db5dc&aff=clip-builder",
     ),
     "openai": ("OpenAI", "https://platform.openai.com/api-keys"),
     "gemini": ("Google Gemini", "https://aistudio.google.com/app/apikey"),
     "deepseek": ("DeepSeek", "https://platform.deepseek.com/api_keys"),
     "volcengine": (
         "ByteDance VolcEngine Ark / Doubao",
-        "https://www.volcengine.com/activity/ai618?utm_source=MoneyPrinterTurbo",
+        "https://www.volcengine.com/activity/ai618?utm_source=clip-builder",
     ),
     "minimax": ("MiniMax", "https://platform.minimax.io/"),
     "mimo": (

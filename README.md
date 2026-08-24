@@ -145,6 +145,20 @@ git clone https://github.com/RafaGomezGuillen/clip-builder.git
 
 On first launch, the project creates `config.toml` from `config.example.toml`. You can configure the LLM provider, footage source, and related API keys directly in the WebUI basic settings.
 
+To add settings introduced by a newer version without replacing values already
+configured, run the update script from the project root:
+
+```shell
+# macOS or Linux
+sh update_toml.sh
+
+# Windows CMD
+update_toml.bat
+```
+
+The script preserves existing values, comments, and formatting. It only adds
+keys that are present in `config.example.toml` but missing from `config.toml`.
+
 ### Manual Deployment 📦
 
 #### ① Create a Python Virtual Environment
@@ -238,7 +252,7 @@ uv run python cli.py --help
 
 ## Voice Synthesis 🗣
 
-The default provider is the free **Edge TTS**, shown as **Azure TTS V1** in the WebUI. clip-builder also supports **Azure TTS V2**, **SiliconFlow TTS**, **Google Gemini TTS**, **Xiaomi MiMo TTS**, **ElevenLabs TTS**, self-hosted **Chatterbox TTS**, and a no-voice mode.
+The default provider is the free **Edge TTS**, shown as **Azure TTS V1** in the WebUI. clip-builder also supports **Azure TTS V2**, **SiliconFlow TTS**, **Google Gemini TTS**, **Xiaomi MiMo TTS**, **ElevenLabs TTS**, self-hosted **Chatterbox TTS**、**Fish Audio TTS**, and a no-voice mode.
 
 Select a provider and voice in the WebUI, then follow the on-screen instructions for any required credentials. Edge TTS does not require an API key; [Azure TTS V2](https://portal.azure.com/) and other cloud providers require credentials from their respective platforms. See the available Edge TTS voices in the [voice list](./docs/voice-list.txt).
 
